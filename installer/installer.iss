@@ -27,7 +27,7 @@
 #define MyAppName "RR-IT Insight Agent"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "Rapid Response IT"
-#define ExtensionId "REPLACE_WITH_CWS_EXTENSION_ID"
+#define ExtensionId "nglaklhklhcoonedhgnpgddginnjdadi"
 #define ExtensionUpdateUrl "https://clients2.google.com/service/update2/crx"
 
 [Setup]
