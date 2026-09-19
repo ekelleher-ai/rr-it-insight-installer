@@ -1,0 +1,51 @@
+name: Build RR-IT Insight installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pusher build deps
+        run: |
+          pip install -r pusher/requirements.txt
+          pip install pyinstaller
+
+      - name: Build pusher.exe with PyInstaller
+        run: |
+          pyinstaller --onefile --name aw_pusher --distpath installer\staging pusher\aw_pusher.py
+
+      - name: Download latest ActivityWatch Windows installer
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ActivityWatch/activitywatch/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "*windows*.exe" -or $_.name -like "*win*setup*.exe" } | Select-Object -First 1
+          if (-not $asset) { throw "Could not find a Windows installer asset in the latest ActivityWatch release" }
+          Write-Host "Downloading $($asset.name) from $($asset.browser_download_url)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "installer\staging\activitywatch-setup.exe"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer
+        shell: cmd
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\installer.iss
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RR-IT-Insight-Setup
+          path: installer\Output\RR-IT-Insight-Setup.exe
+          retention-days: 30
