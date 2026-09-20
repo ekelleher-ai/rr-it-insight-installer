@@ -94,7 +94,7 @@ begin
   SetArrayLength(Lines, 7);
   Lines[0] := '{';
   Lines[1] := '  "aw_api_url": "http://localhost:5600",';
-  Lines[2] := '  "zite_ingest_url": "https://rr-it-insight.zite.so/api/ingestEvents",';
+  Lines[2] := '  "zite_ingest_url": "https://2wgpdcmeym.zite.so/api/ingestEvents",';
   Lines[3] := '  "api_key": "' + ConfigPage.Values[1] + '",';
   Lines[4] := '  "client_id": "' + ConfigPage.Values[0] + '",';
   Lines[5] := '  "poll_interval_seconds": 30';
