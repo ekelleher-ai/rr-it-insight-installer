@@ -144,16 +144,17 @@ begin
       '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
-    // Step 2b: launch ActivityWatch now, and register it to autostart at
-    // every future logon — its own installer being silent means neither
-    // of those otherwise happens on its own.
+    // Step 2b: launch ActivityWatch now, so it's up immediately rather than
+    // waiting for the next logon. NOTE: we deliberately do NOT also
+    // register our own autostart entry for it — ActivityWatch's own
+    // installer already drops a Startup-folder shortcut
+    // (shell:startup\ActivityWatch.lnk) for that. Confirmed by testing:
+    // adding a second, our-own Run-key entry on top of that caused two
+    // full copies of AW (aw-qt, aw-server, both watchers) to launch at
+    // every logon.
     AwExePath := FindActivityWatchExe();
     if AwExePath <> '' then
-    begin
       Exec(AwExePath, '', '', SW_HIDE, ewNoWait, ResultCode);
-      RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run',
-        'ActivityWatch', '"' + AwExePath + '"');
-    end;
 
     // Step 4: Scheduled Task — runs at logon, restarts if it stops.
     Exec(ExpandConstant('{sys}\schtasks.exe'),
@@ -181,9 +182,9 @@ begin
   begin
     Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "RR-IT Insight Pusher"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    // Uninstalling us shouldn't leave ActivityWatch launching itself forever
-    // with no pusher to feed it. This does not uninstall ActivityWatch
-    // itself (see README) — just our autostart entry for it.
-    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ActivityWatch');
+    // We don't write our own ActivityWatch autostart entry (see
+    // CurStepChanged above — AW's own installer already does this via a
+    // Startup-folder shortcut), so there's nothing of ours to clean up
+    // here. This does not uninstall ActivityWatch itself (see README).
   end;
 end;
