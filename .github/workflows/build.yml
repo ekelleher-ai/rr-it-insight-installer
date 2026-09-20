@@ -28,8 +28,15 @@ jobs:
 
       - name: Download latest ActivityWatch Windows installer
         shell: pwsh
+        env:
+          # Authenticated GitHub API requests get a much higher rate limit
+          # (5000/hr) than anonymous ones (60/hr, shared across every
+          # GitHub-hosted runner on this IP) — anonymous ran out after a
+          # handful of builds in the same hour. GITHUB_TOKEN is injected
+          # automatically by Actions, no setup needed.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ActivityWatch/activitywatch/releases/latest"
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ActivityWatch/activitywatch/releases/latest" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" }
           $asset = $release.assets | Where-Object { $_.name -like "*windows*.exe" -or $_.name -like "*win*setup*.exe" } | Select-Object -First 1
           if (-not $asset) { throw "Could not find a Windows installer asset in the latest ActivityWatch release" }
           Write-Host "Downloading $($asset.name) from $($asset.browser_download_url)"
