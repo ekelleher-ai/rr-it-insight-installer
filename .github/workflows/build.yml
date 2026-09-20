@@ -24,7 +24,7 @@ jobs:
 
       - name: Build pusher.exe with PyInstaller
         run: |
-          pyinstaller --onefile --name aw_pusher --distpath installer\staging pusher\aw_pusher.py
+          pyinstaller --onefile --noconsole --name aw_pusher --distpath installer\staging pusher\aw_pusher.py
 
       - name: Download latest ActivityWatch Windows installer
         shell: pwsh
