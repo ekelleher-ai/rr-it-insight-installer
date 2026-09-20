@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import sqlite3
 import sys
@@ -47,8 +48,30 @@ import requests
 # Config
 # --------------------------------------------------------------------------
 
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
-DEFAULT_STATE_DIR = Path(__file__).with_name("state")
+def _app_dir() -> Path:
+    """Directory the pusher should treat as "home" for its files.
+
+    A normal `python aw_pusher.py` run uses the script's own folder. A
+    PyInstaller --onefile build is different: __file__ resolves to a
+    temp extraction folder (_MEIxxxxx), not the real .exe's folder, so
+    anything relying on Path(__file__) silently looks in the wrong place
+    the moment the exe is run without an explicit config path argument.
+    sys.executable is the one that's reliable in a frozen build.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+# ProgramData rather than the exe's own folder (often Program Files) so this
+# works whether the pusher runs elevated (during testing) or as a normal,
+# non-admin client user at logon — Program Files isn't writable by standard
+# users, ProgramData is.
+_DATA_DIR = Path(os.environ.get("PROGRAMDATA", str(_app_dir()))) / "RR-IT Insight"
+
+DEFAULT_CONFIG_PATH = _app_dir() / "config.json"
+DEFAULT_STATE_DIR = _DATA_DIR / "state"
+DEFAULT_LOG_PATH = _DATA_DIR / "pusher.log"
 
 BROWSER_APP_NAMES = {
     "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
@@ -500,14 +523,25 @@ def poll_once(aw: AWClient, state: State, cfg: Config, log: logging.Logger) -> N
 
 
 def main() -> None:
+    # Built with --noconsole for real installs (see build.yml), so there is
+    # no console to print to — sys.stdout/stderr are None, and a plain
+    # StreamHandler would crash the first time it tries to write. Log to a
+    # file instead; this is also what actually lets us support a client
+    # remotely, since nobody's watching a console window on their machine.
+    DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")]
+    if sys.stdout is not None:
+        handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
     )
     log = logging.getLogger("aw_pusher")
 
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG_PATH
     cfg = Config.load(config_path)
+    DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
     state = State(DEFAULT_STATE_DIR / "state.sqlite3")
     session = requests.Session()
     aw = AWClient(cfg.aw_api_url, session)
