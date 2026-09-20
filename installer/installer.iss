@@ -20,9 +20,13 @@
 ;      unconditionally installing into both is simpler and harmless if a
 ;      browser isn't present (the policy just sits unused).
 ;
-; NOTE: EXTENSION_ID and EXTENSION_UPDATE_URL below are placeholders —
-; confirm aw-watcher-web's real Chrome Web Store listing/ID before
-; shipping this to a client, and update both constants. See README.md.
+; Extension ID confirmed against the official Chrome Web Store listing
+; ("ActivityWatch Web Watcher", published by ActivityWatch, linked to
+; github.com/ActivityWatch/aw-watcher-web):
+; https://chromewebstore.google.com/detail/activitywatch-web-watcher/nglaklhklhcoonedhgnpgddginnjdadi
+; Untested on Edge — if Edge's Chrome-Web-Store-via-policy install doesn't
+; work in practice, it may need its own Edge Add-ons listing instead. Worth
+; a one-off test on a spare machine before relying on it for a real client.
 
 #define MyAppName "RR-IT Insight Agent"
 #define MyAppVersion "1.0.0"
@@ -98,9 +102,38 @@ begin
   SaveStringsToFile(ConfigPath, Lines, False);
 end;
 
+// ActivityWatch's own installer is silent (/VERYSILENT), so nothing launches
+// it afterwards and nothing guarantees it starts at the next logon either —
+// confirmed by testing: the pusher started before AW did and had to retry
+// for several minutes until AW was opened by hand. This finds wherever AW
+// actually landed (its own installer can go to either location depending on
+// version) and both starts it right away and registers it to autostart.
+function FindActivityWatchExe(): string;
+var
+  Candidate: string;
+begin
+  Result := '';
+  Candidate := ExpandConstant('{localappdata}\Programs\ActivityWatch\aw-qt.exe');
+  if FileExists(Candidate) then
+  begin
+    Result := Candidate;
+    Exit;
+  end;
+  Candidate := ExpandConstant('{pf}\ActivityWatch\aw-qt.exe');
+  if FileExists(Candidate) then
+  begin
+    Result := Candidate;
+    Exit;
+  end;
+  Candidate := ExpandConstant('{autopf}\ActivityWatch\aw-qt.exe');
+  if FileExists(Candidate) then
+    Result := Candidate;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
+  AwExePath: string;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -110,6 +143,17 @@ begin
     Exec(ExpandConstant('{tmp}\activitywatch-setup.exe'),
       '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+    // Step 2b: launch ActivityWatch now, and register it to autostart at
+    // every future logon — its own installer being silent means neither
+    // of those otherwise happens on its own.
+    AwExePath := FindActivityWatchExe();
+    if AwExePath <> '' then
+    begin
+      Exec(AwExePath, '', '', SW_HIDE, ewNoWait, ResultCode);
+      RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run',
+        'ActivityWatch', '"' + AwExePath + '"');
+    end;
 
     // Step 4: Scheduled Task — runs at logon, restarts if it stops.
     Exec(ExpandConstant('{sys}\schtasks.exe'),
@@ -137,5 +181,9 @@ begin
   begin
     Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "RR-IT Insight Pusher"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Uninstalling us shouldn't leave ActivityWatch launching itself forever
+    // with no pusher to feed it. This does not uninstall ActivityWatch
+    // itself (see README) — just our autostart entry for it.
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ActivityWatch');
   end;
 end;
