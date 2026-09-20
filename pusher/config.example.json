@@ -1,6 +1,6 @@
 {
   "aw_api_url": "http://localhost:5600",
-  "zite_ingest_url": "https://rr-it-insight.zite.so/api/ingestEvents",
+  "zite_ingest_url": "https://2wgpdcmeym.zite.so/api/ingestEvents",
   "api_key": "PASTE-CLIENT-INGEST-KEY-HERE",
   "client_id": "PASTE-CLIENT-ID-HERE",
   "poll_interval_seconds": 30
