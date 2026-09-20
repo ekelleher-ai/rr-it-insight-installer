@@ -21,13 +21,25 @@ Actions tab ("Run workflow"). It:
 4. Uploads the finished installer as a workflow artifact — go to the **Actions**
    tab, open the latest run, and download it from there.
 
+## Diagnosing a client machine
+
+The pusher runs invisibly by design (built with `--noconsole` — a client should
+never see a black window pop up at logon) and logs to
+`C:\ProgramData\RR-IT Insight\pusher.log` instead. That's the first thing to
+check if a client reports missing data: confirm the log is growing, and look
+for repeated "Could not reach local ActivityWatch API" warnings, which usually
+just means ActivityWatch itself isn't running (check for `aw-qt.exe` /
+`aw-server.exe` in Task Manager).
+
 ## Before shipping this to a client
 
-- **Confirm the aw-watcher-web extension ID.** `installer/installer.iss` has a
-  placeholder `ExtensionId` constant — look up aw-watcher-web's real Chrome
-  Web Store listing and paste its ID in before building for real use. If Edge
-  doesn't accept installs from the Chrome Web Store update URL, it may need
-  its own Edge Add-ons listing instead — worth testing once on a spare machine.
+- **aw-watcher-web extension ID** — confirmed and wired in: `nglaklhklhcoonedhgnpgddginnjdadi`,
+  the official "ActivityWatch Web Watcher" listing published by ActivityWatch
+  ([Chrome Web Store](https://chromewebstore.google.com/detail/activitywatch-web-watcher/nglaklhklhcoonedhgnpgddginnjdadi)).
+  Still worth a one-off real-machine test before relying on it for a client —
+  in particular, Edge accepting an install from the Chrome Web Store's update
+  URL via policy is common but not guaranteed; if it doesn't take, aw-watcher-web
+  may need its own Edge Add-ons listing instead.
 - **Per-client keys**: right now the installer asks the admin to paste in the
   Client ID and Ingest API Key during setup (given to them by RR-IT). A future
   "Generate installer" button in the client dashboard (planned, not built yet)
