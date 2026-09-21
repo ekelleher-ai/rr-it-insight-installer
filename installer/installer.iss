@@ -17,6 +17,13 @@
 ;   4b. Adds Windows Defender exclusions for our own folders/processes
 ;      (silent, best-effort — no-op if Defender isn't the active AV).
 ;      COMODO and McAfee need the same done manually — see README.md.
+;   4c. OPTIONAL, off by default: if the wizard's "USB removable-drive
+;      monitoring" checkbox is ticked, also registers a Scheduled Task
+;      for usb_watcher.exe — see that script's own header and README.md's
+;      "USB removable-drive monitoring" section for what it does and its
+;      limits. Only tick this for a client who specifically asked for it;
+;      it also still requires this client to be enabled for USB
+;      Monitoring in the RR-IT console before anything is recorded.
 ;   5. Force-installs the aw-watcher-web browser extension for BOTH Chrome
 ;      and Edge via the ExtensionInstallForcelist registry policy, so it
 ;      works whichever browser(s) this client's staff actually use —
@@ -69,11 +76,17 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "staging\activitywatch-setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 ; Pusher — PyInstaller onefile build, staged by CI.
 Source: "staging\aw_pusher.exe"; DestDir: "{app}"; Flags: ignoreversion
+; USB watcher — optional add-on, always shipped in the installer but only
+; ever run when the wizard's checkbox was ticked (see WriteConfigFile and
+; CurStepChanged below). Shipping it unconditionally is simpler than a
+; second CI build variant; it just sits unused for clients who don't need it.
+Source: "staging\usb_watcher.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\pusher\config.example.json"; DestDir: "{app}"; DestName: "config.json.template"; Flags: ignoreversion
 
 [Code]
 var
   ConfigPage: TInputQueryWizardPage;
+  UsbPage: TInputOptionWizardPage;
 
 procedure InitializeWizard;
 begin
@@ -83,6 +96,25 @@ begin
     'You should have been given these by RR-IT. If not, contact support before continuing.');
   ConfigPage.Add('Client ID:', False);
   ConfigPage.Add('Ingest API Key:', True);
+
+  // Optional add-on, off by default — only for a client with a specific
+  // requirement to know about files copied onto a USB drive. See
+  // usb_watcher.py's own header for exactly what this can and can't see.
+  UsbPage := CreateInputOptionPage(ConfigPage.ID,
+    'USB Removable-Drive Monitoring (optional)',
+    'Only enable this if RR-IT told you this client specifically needs it',
+    'When enabled, this device will log when a USB storage device is plugged in, ' +
+    'unplugged, and which files are written to it. Leave this unticked for a standard install — ' +
+    'most clients don''t need it, and it also has to be switched on for this client in the RR-IT console ' +
+    'before anything is actually recorded.',
+    False, False);
+  UsbPage.Add('Enable USB removable-drive monitoring on this device');
+  UsbPage.Values[0] := False;
+end;
+
+function UsbMonitoringEnabled(): Boolean;
+begin
+  Result := UsbPage.Values[0];
 end;
 
 function GetClientId(Param: string): string;
@@ -99,16 +131,23 @@ procedure WriteConfigFile;
 var
   ConfigPath: string;
   Lines: TArrayOfString;
+  UsbEnabledStr: string;
 begin
+  if UsbMonitoringEnabled() then
+    UsbEnabledStr := 'true'
+  else
+    UsbEnabledStr := 'false';
+
   ConfigPath := ExpandConstant('{app}\config.json');
-  SetArrayLength(Lines, 7);
+  SetArrayLength(Lines, 8);
   Lines[0] := '{';
   Lines[1] := '  "aw_api_url": "http://localhost:5600",';
   Lines[2] := '  "zite_ingest_url": "https://2wgpdcmeym.zite.so/api/ingestEvents",';
   Lines[3] := '  "api_key": "' + ConfigPage.Values[1] + '",';
   Lines[4] := '  "client_id": "' + ConfigPage.Values[0] + '",';
-  Lines[5] := '  "poll_interval_seconds": 30';
-  Lines[6] := '}';
+  Lines[5] := '  "poll_interval_seconds": 30,';
+  Lines[6] := '  "usb_monitoring_enabled": ' + UsbEnabledStr;
+  Lines[7] := '}';
   SaveStringsToFile(ConfigPath, Lines, False);
 end;
 
@@ -173,7 +212,7 @@ begin
     '-NoProfile -ExecutionPolicy Bypass -Command "' +
     'try { ' +
     'Add-MpPreference -ExclusionPath @(''' + AppDir + ''', ''' + AwDir + ''', ''' + ProgramDataDir + ''') -ErrorAction SilentlyContinue; ' +
-    'Add-MpPreference -ExclusionProcess @(''aw_pusher.exe'', ''aw-qt.exe'', ''aw-server.exe'', ''aw-watcher-afk.exe'', ''aw-watcher-window.exe'') -ErrorAction SilentlyContinue ' +
+    'Add-MpPreference -ExclusionProcess @(''aw_pusher.exe'', ''aw-qt.exe'', ''aw-server.exe'', ''aw-watcher-afk.exe'', ''aw-watcher-window.exe'', ''usb_watcher.exe'') -ErrorAction SilentlyContinue ' +
     '} catch { }"';
   Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), PsCommand,
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
@@ -222,6 +261,21 @@ begin
       '/Run /TN "RR-IT Insight Pusher"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
+    // Step 4b: USB watcher — only registered when the wizard checkbox was
+    // ticked. usb_watcher.exe is always copied to {app} above, but a
+    // client who didn't ask for this gets no Scheduled Task for it at
+    // all, so nothing of it ever runs on their machine.
+    if UsbMonitoringEnabled() then
+    begin
+      Exec(ExpandConstant('{sys}\schtasks.exe'),
+        '/Create /F /SC ONLOGON /RL HIGHEST /TN "RR-IT Insight USB Watcher" ' +
+        '/TR "\"' + ExpandConstant('{app}') + '\usb_watcher.exe\" \"' + ExpandConstant('{app}') + '\config.json\""',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      Exec(ExpandConstant('{sys}\schtasks.exe'),
+        '/Run /TN "RR-IT Insight USB Watcher"',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+
     // Step 5: force-install aw-watcher-web for Chrome AND Edge.
     RegWriteStringValue(HKLM, 'SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist', '1',
       '{#ExtensionId};{#ExtensionUpdateUrl}');
@@ -260,6 +314,12 @@ begin
     Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "RR-IT Insight Pusher"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM aw_pusher.exe',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // USB watcher — deleting a Scheduled Task/killing a process that was
+    // never created/running (most installs) is a harmless no-op here.
+    Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "RR-IT Insight USB Watcher"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM usb_watcher.exe',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
     if RemoveAw = IDYES then
