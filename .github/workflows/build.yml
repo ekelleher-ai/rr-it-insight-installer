@@ -26,6 +26,10 @@ jobs:
         run: |
           pyinstaller --onefile --noconsole --name aw_pusher --distpath installer\staging pusher\aw_pusher.py
 
+      - name: Build usb_watcher.exe with PyInstaller
+        run: |
+          pyinstaller --onefile --noconsole --name usb_watcher --distpath installer\staging pusher\usb_watcher.py
+
       - name: Download latest ActivityWatch Windows installer
         shell: pwsh
         env:
