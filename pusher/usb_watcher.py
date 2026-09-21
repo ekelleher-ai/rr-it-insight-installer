@@ -99,6 +99,20 @@ DEBOUNCE_SECONDS = 30
 # USB flash drives and SD cards via a reader both report this.
 DRIVE_REMOVABLE = 2
 
+# Named mutex used to make sure only one copy of this watcher is ever
+# actually doing work at once. Confirmed live: the installer's Scheduled
+# Task fires an immediate /Run on every install AND reinstall, on top of
+# the task's own "run at logon" trigger, with no check for an existing
+# copy already running — and since this script loops forever, each extra
+# launch just piles up as another permanent, fully independent watcher.
+# Two independent copies both see the same drive and both report their
+# own events, which is what produced exact, consistent duplicate pairs
+# (2x every connect/disconnect/file-written, at near-identical
+# timestamps) — not a flaky USB port, and not something a debounce delay
+# can fix, since each copy has no idea the other exists.
+SINGLE_INSTANCE_MUTEX_NAME = "Global\\RRITInsightUsbWatcherSingleInstance"
+ERROR_ALREADY_EXISTS = 183
+
 # Folders/files Windows itself writes to a removable drive just by looking at
 # it (indexing, thumbnails, the recycle bin) — not something a person put
 # there, and pure noise in a "what did they copy" report. Matched
@@ -267,6 +281,23 @@ def get_volume_info(drive_letter: str) -> tuple[Optional[str], Optional[str]]:
         return None, None
 
 
+def acquire_single_instance_lock() -> bool:
+    """Best-effort Windows named-mutex lock. Returns True if this process
+    is the only one holding it (safe to proceed), False if another copy
+    already holds it (this process should exit without doing any work).
+    The handle is deliberately never closed — it releases automatically
+    when this process exits, which is exactly when we want the lock
+    freed. If mutex creation itself fails for some reason, fail OPEN
+    (return True) rather than refuse to run the watcher at all."""
+    try:
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        if not handle:
+            return True
+        return ctypes.windll.kernel32.GetLastError() != ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
+
+
 def scan_drive(drive_letter: str, log: logging.Logger) -> dict[str, tuple[float, int]]:
     """Return {relative_path: (mtime, size)} for every file on the drive,
     capped at MAX_FILES_PER_DRIVE_SCAN so a huge/slow drive can't hang a
@@ -372,6 +403,14 @@ def main() -> None:
         handlers=handlers,
     )
     log = logging.getLogger("usb_watcher")
+
+    if not acquire_single_instance_lock():
+        log.info(
+            "Another copy of the USB watcher is already running on this "
+            "machine — exiting immediately rather than running a second, "
+            "independent copy (which would double up every event)."
+        )
+        return
 
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG_PATH
     cfg = Config.load(config_path)
