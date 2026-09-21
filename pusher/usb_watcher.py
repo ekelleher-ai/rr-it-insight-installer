@@ -82,9 +82,29 @@ SEND_BATCH_SIZE = 200
 MAX_BACKOFF_SECONDS = 300
 MAX_FILES_PER_DRIVE_SCAN = 20000  # safety cap so a huge drive can't hang a poll cycle
 
+# How long a drive can vanish and reappear before we treat it as a genuinely
+# new connect/disconnect. Some setups make a drive blip on and off within a
+# second or two without anyone touching it — most commonly a VM host's USB
+# arbitrator (e.g. VMware) handing the device back and forth between the
+# host and a guest — and without this, each blip looked like a full
+# disconnect+reconnect: a duplicate "connected" event, and a duplicate
+# "file written" for every file already on it (since reconnecting re-ran
+# the baseline scan). Confirmed live on a VMware test machine: a single
+# plug-in produced 4 connect events and 2 duplicate file-written events
+# for the same file before this fix. A real removal is still reported —
+# just after sitting gone for this long, not instantly.
+DEBOUNCE_SECONDS = 30
+
 # Windows drive type constant (from GetDriveTypeW) for removable media —
 # USB flash drives and SD cards via a reader both report this.
 DRIVE_REMOVABLE = 2
+
+# Folders/files Windows itself writes to a removable drive just by looking at
+# it (indexing, thumbnails, the recycle bin) — not something a person put
+# there, and pure noise in a "what did they copy" report. Matched
+# case-insensitively against path components/filenames.
+IGNORED_DIR_NAMES = {"system volume information", "$recycle.bin"}
+IGNORED_FILE_NAMES = {"desktop.ini", "thumbs.db", "autorun.inf"}
 
 
 @dataclass
@@ -254,8 +274,14 @@ def scan_drive(drive_letter: str, log: logging.Logger) -> dict[str, tuple[float,
     snapshot: dict[str, tuple[float, int]] = {}
     count = 0
     try:
-        for root, _dirs, files in os.walk(drive_letter):
+        for root, dirs, files in os.walk(drive_letter):
+            # Don't even descend into Windows' own housekeeping folders —
+            # cheaper than filtering afterwards, and keeps a $Recycle.Bin
+            # full of a client's own deleted files out of the report too.
+            dirs[:] = [d for d in dirs if d.lower() not in IGNORED_DIR_NAMES]
             for name in files:
+                if name.lower() in IGNORED_FILE_NAMES:
+                    continue
                 if count >= MAX_FILES_PER_DRIVE_SCAN:
                     log.warning(
                         "%s has more than %d files — stopped scanning early, "
@@ -370,14 +396,30 @@ def main() -> None:
 
     # drive_letter -> {"name": ..., "serial": ..., "files": {rel_path: (mtime, size)}}
     tracked: dict[str, dict] = {}
+    # drive_letter -> {"info": <same shape as a tracked entry>, "disconnected_at": epoch_seconds}
+    # Drives that vanished but might just be blipping — see DEBOUNCE_SECONDS.
+    pending_disconnect: dict[str, dict] = {}
 
     while True:
         try:
+            now_ts = time.time()
             current_drives = set(list_removable_drives())
             known_drives = set(tracked.keys())
 
             # Newly connected drives.
             for drive in current_drives - known_drives:
+                if drive in pending_disconnect:
+                    # Reappeared before the debounce window elapsed — same
+                    # session, not a new device. Resume with the baseline we
+                    # already had rather than re-scanning from scratch, so
+                    # files already on it don't get reported as "written"
+                    # again, and no duplicate connect event is sent either.
+                    tracked[drive] = pending_disconnect.pop(drive)["info"]
+                    log.info(
+                        "%s reappeared within %ds — treating as still connected, not a new device",
+                        drive, DEBOUNCE_SECONDS,
+                    )
+                    continue
                 label, serial = get_volume_info(drive)
                 device_name = label or drive.rstrip("\\")
                 log.info("USB device connected: %s (serial %s)", device_name, serial or "unknown")
@@ -391,20 +433,31 @@ def main() -> None:
                     "driveLetter": drive,
                 }])
 
-            # Disconnected drives.
+            # Drives that disappeared — start the debounce clock rather than
+            # reporting a disconnect immediately.
             for drive in known_drives - current_drives:
-                info = tracked.pop(drive)
-                log.info("USB device disconnected: %s", info["name"])
-                state.enqueue([{
-                    "eventType": "disconnected",
-                    "timestamp": _now_iso(),
-                    "usbDeviceName": info["name"],
-                    "usbSerialNumber": info["serial"],
-                    "driveLetter": drive,
-                }])
+                pending_disconnect[drive] = {"info": tracked.pop(drive), "disconnected_at": now_ts}
+
+            # Drives that have been gone longer than the debounce window are
+            # real disconnects.
+            for drive in list(pending_disconnect.keys()):
+                entry = pending_disconnect[drive]
+                if now_ts - entry["disconnected_at"] >= DEBOUNCE_SECONDS:
+                    info = pending_disconnect.pop(drive)["info"]
+                    log.info("USB device disconnected: %s", info["name"])
+                    state.enqueue([{
+                        "eventType": "disconnected",
+                        "timestamp": _now_iso(),
+                        "usbDeviceName": info["name"],
+                        "usbSerialNumber": info["serial"],
+                        "driveLetter": drive,
+                    }])
 
             # Still-connected drives: re-scan and report new/changed files.
-            for drive in current_drives & known_drives:
+            # (Checked against tracked's current keys, not the known_drives
+            # snapshot from the top of the loop, so a drive just resumed from
+            # pending_disconnect above is included in this cycle too.)
+            for drive in current_drives & set(tracked.keys()):
                 info = tracked[drive]
                 current_files = scan_drive(drive, log)
                 new_events = []
