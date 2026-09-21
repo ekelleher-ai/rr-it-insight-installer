@@ -31,6 +31,54 @@ for repeated "Could not reach local ActivityWatch API" warnings, which usually
 just means ActivityWatch itself isn't running (check for `aw-qt.exe` /
 `aw-server.exe` in Task Manager).
 
+## Uninstalling (client cancels the service)
+
+Uninstalling — from Windows Settings > Apps, or by running `unins000.exe`
+under the install folder — is a **full removal**, not just this app. It asks
+for confirmation, then:
+
+1. Deletes the "RR-IT Insight Pusher" Scheduled Task and kills `aw_pusher.exe`.
+2. If confirmed: kills ActivityWatch's processes, runs **ActivityWatch's own
+   uninstaller** silently (found wherever it landed, matching the installer's
+   own search logic), deletes its Startup-folder shortcut as a backstop, and
+   removes the forced `aw-watcher-web` browser-extension policy for Chrome
+   and Edge.
+3. Deletes `C:\ProgramData\RR-IT Insight\` (the pusher's log and local state)
+   either way.
+
+A client who cancels is left with nothing from RR-IT Insight still running,
+autostarting, or logging on their machine.
+
+## Antivirus exclusions
+
+Confirmed live on a test machine: COMODO silently disabled our Scheduled Task
+after install with no visible error — the pusher looked "installed" but never
+ran again after the first logon. Most RR-IT clients run one of COMODO, McAfee,
+or plain Windows Defender, so exclusions need adding for all three:
+
+- **Windows Defender** — handled automatically by the installer (`installer.iss`,
+  `AddDefenderExclusions`), via `Add-MpPreference`. Nothing to do by hand.
+- **COMODO and McAfee** — no safe, universal silent command across their many
+  product editions, so this is a manual step during onboarding (2 minutes in
+  each console). Add these as exclusions/exceptions:
+  - **Paths:**
+    - `C:\Program Files\RR-IT Insight\` (or wherever it was installed, if
+      the admin changed the default during setup)
+    - ActivityWatch's install folder — usually
+      `C:\Users\<user>\AppData\Local\Programs\ActivityWatch\`, but check;
+      some machines have it under Program Files instead
+    - `C:\ProgramData\RR-IT Insight\`
+  - **Processes:** `aw_pusher.exe`, `aw-qt.exe`, `aw-server.exe`,
+    `aw-watcher-afk.exe`, `aw-watcher-window.exe`
+  - In COMODO specifically, also check **HIPS** and **Containment** (not just
+    the antivirus scan exclusions) — a HIPS rule silently blocking the
+    Scheduled Task's action, rather than a virus scan quarantining a file,
+    is what actually happened on the test machine.
+  - Worth automating properly if this keeps coming up — COMODO does have a
+    command-line config import (`cfp_config`/`cmdagent`) and McAfee's managed
+    products can be scripted via ePO, but both need per-deployment testing
+    before it'd be safe to run unattended from this installer; not done yet.
+
 ## Before shipping this to a client
 
 - **aw-watcher-web extension ID** — confirmed and wired in: `nglaklhklhcoonedhgnpgddginnjdadi`,
