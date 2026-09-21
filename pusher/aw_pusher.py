@@ -401,4 +401,216 @@ def dedupe_growing_events(
     is still focused returns the SAME event again — same `timestamp`, bigger
     `duration` — and left alone we'd re-enqueue its FULL duration each time,
     massively double- (or, for something left open a long time, like a
-    screensaver, many-times-) counting
+    screensaver, many-times-) counting it.
+
+    This rewrites each such repeat into just the NEW seconds since we last
+    saw it, using `progress` (the last timestamp we processed for this
+    bucket, and how much of ITS duration we've already sent). A genuinely
+    new event (different timestamp) resets progress and is sent in full.
+    """
+    last_ts, sent = progress
+    out = []
+    for e in window_events:
+        ts = e["timestamp"]
+        duration = float(e.get("duration", 0))
+        if last_ts is not None and ts == last_ts:
+            delta = duration - sent
+            sent = duration
+            if delta <= 0:
+                continue  # AW returned it unchanged — nothing new to send
+            e = {**e, "duration": delta}
+        else:
+            sent = duration
+        last_ts = ts
+        out.append(e)
+    return out, (last_ts, sent)
+
+
+def transform_window_events(
+    window_events: list[dict],
+    afk_intervals: list[tuple[datetime, datetime]],
+    web_lookup: list[tuple[datetime, datetime, str, str, str]],
+) -> list[dict]:
+    out = []
+    for e in window_events:
+        data = e.get("data", {})
+        app = data.get("app", "unknown")
+        title = data.get("title", "")
+        start = _parse_ts(e["timestamp"])
+        duration_s = float(e.get("duration", 0))
+        if duration_s <= 0:
+            continue
+
+        app_or_domain = app
+        url = None
+        if app.lower() in BROWSER_APP_NAMES:
+            match = find_domain_for_window(start, duration_s, web_lookup)
+            if match:
+                app_or_domain, title, url = match[0], match[1] or title, match[2]
+
+        idle = overlaps_afk(start, duration_s, afk_intervals)
+
+        out.append(
+            {
+                "appOrDomain": app_or_domain,
+                "title": title,
+                "url": url,
+                "timestamp": start.isoformat(),
+                "durationSeconds": duration_s,
+                "idleFlag": idle,
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
+# Send loop
+# --------------------------------------------------------------------------
+
+def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> None:
+    backoff = 1
+    while True:
+        batch = state.peek_batch(SEND_BATCH_SIZE)
+        if not batch:
+            return
+
+        # Zite's app endpoints expect the actual arguments wrapped under an
+        # "inputs" key, not sent flat as the top-level POST body.
+        payload = {
+            "inputs": {
+                "apiKey": cfg.api_key,
+                "clientId": cfg.client_id,
+                "hostname": cfg.hostname,
+                "userName": cfg.user_name,
+                "events": [
+                    {
+                        "appOrDomain": row["app_or_domain"],
+                        "title": row["title"],
+                        "url": row["url"] if "url" in row.keys() else None,
+                        "timestamp": row["timestamp_iso"],
+                        "durationSeconds": row["duration_seconds"],
+                        "idleFlag": bool(row["idle_flag"]),
+                    }
+                    for row in batch
+                ],
+            }
+        }
+
+        try:
+            r = session.post(cfg.zite_ingest_url, json=payload, timeout=30)
+        except requests.RequestException as exc:
+            log.warning("Ingest POST failed (network): %s — will retry", exc)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            return  # stop this flush cycle; next poll cycle will retry
+
+        if r.status_code == 200:
+            state.delete_ids([row["id"] for row in batch])
+            backoff = 1
+            log.info("Pushed %d events (outbox now %d)", len(batch), state.outbox_size())
+            continue  # keep draining if more remain
+
+        if r.status_code in (401, 403):
+            log.error(
+                "Ingest rejected the request (%s): %s — check api_key/client_id/tenant status. "
+                "Leaving events queued.",
+                r.status_code,
+                r.text[:300],
+            )
+            return
+
+        log.warning("Ingest returned %s: %s — will retry", r.status_code, r.text[:300])
+        time.sleep(backoff)
+        backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+        return
+
+
+def poll_once(aw: AWClient, state: State, cfg: Config, log: logging.Logger) -> None:
+    buckets = aw.list_buckets()
+    window_id, afk_id, web_ids = pick_buckets(buckets, cfg.hostname)
+
+    if not window_id:
+        log.warning("No currentwindow bucket found — is ActivityWatch's window watcher running?")
+        return
+
+    afk_events = aw.get_events(afk_id, state.get_watermark(afk_id), POLL_BATCH_LIMIT) if afk_id else []
+    afk_intervals = build_afk_intervals(afk_events)
+    if afk_id and afk_events:
+        state.set_watermark(afk_id, afk_events[-1]["timestamp"])
+
+    web_lookup: list[tuple[datetime, datetime, str, str]] = []
+    for wid in web_ids:
+        web_events = aw.get_events(wid, state.get_watermark(wid), POLL_BATCH_LIMIT)
+        web_lookup.extend(build_web_domain_lookup(web_events))
+        if web_events:
+            state.set_watermark(wid, web_events[-1]["timestamp"])
+
+    window_events = aw.get_events(window_id, state.get_watermark(window_id), POLL_BATCH_LIMIT)
+    if not window_events:
+        return
+
+    progress = state.get_progress(window_id)
+    deduped_events, new_progress = dedupe_growing_events(window_events, progress)
+    state.set_progress(window_id, *new_progress)
+
+    transformed = transform_window_events(deduped_events, afk_intervals, web_lookup)
+    state.enqueue(transformed)
+    state.set_watermark(window_id, window_events[-1]["timestamp"])
+    log.info("Queued %d events from AW (outbox now %d)", len(transformed), state.outbox_size())
+
+
+def main() -> None:
+    # Built with --noconsole for real installs (see build.yml), so there is
+    # no console to print to — sys.stdout/stderr are None, and a plain
+    # StreamHandler would crash the first time it tries to write. Log to a
+    # file instead; this is also what actually lets us support a client
+    # remotely, since nobody's watching a console window on their machine.
+    DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")]
+    if sys.stdout is not None:
+        handlers.append(logging.StreamHandler(sys.stdout))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+    )
+    log = logging.getLogger("aw_pusher")
+
+    if not acquire_single_instance_lock():
+        log.info(
+            "Another copy of the pusher is already running on this machine "
+            "— exiting immediately rather than running a second, "
+            "independent copy."
+        )
+        return
+
+    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG_PATH
+    cfg = Config.load(config_path)
+    DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = State(DEFAULT_STATE_DIR / "state.sqlite3")
+    session = requests.Session()
+    aw = AWClient(cfg.aw_api_url, session)
+
+    log.info(
+        "RR-IT Insight pusher starting — host=%s client=%s aw=%s -> %s",
+        cfg.hostname, cfg.client_id, cfg.aw_api_url, cfg.zite_ingest_url,
+    )
+
+    while True:
+        try:
+            poll_once(aw, state, cfg, log)
+        except requests.RequestException as exc:
+            log.warning("Could not reach local ActivityWatch API: %s", exc)
+        except Exception:
+            log.exception("Unexpected error during poll — continuing")
+
+        try:
+            flush_outbox(state, cfg, session, log)
+        except Exception:
+            log.exception("Unexpected error during flush — continuing")
+
+        time.sleep(cfg.poll_interval_seconds)
+
+
+if __name__ == "__main__":
+    main()
