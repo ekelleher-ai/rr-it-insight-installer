@@ -3,5 +3,6 @@
   "zite_ingest_url": "https://2wgpdcmeym.zite.so/api/ingestEvents",
   "api_key": "PASTE-CLIENT-INGEST-KEY-HERE",
   "client_id": "PASTE-CLIENT-ID-HERE",
-  "poll_interval_seconds": 30
+  "poll_interval_seconds": 30,
+  "usb_monitoring_enabled": false
 }
