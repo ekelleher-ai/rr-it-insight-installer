@@ -79,6 +79,42 @@ or plain Windows Defender, so exclusions need adding for all three:
     products can be scripted via ePO, but both need per-deployment testing
     before it'd be safe to run unattended from this installer; not done yet.
 
+## USB removable-drive monitoring (optional, per-client add-on)
+
+Off by default — only turn this on for a client with a specific requirement to
+know when a USB storage device is used to copy files off a monitored PC.
+Two things both have to be true for it to actually record anything:
+
+1. **On the device**: the installer wizard's "Enable USB removable-drive
+   monitoring on this device" checkbox must be ticked at install time. This
+   registers a second Scheduled Task ("RR-IT Insight USB Watcher") running
+   `usb_watcher.py`/`usb_watcher.exe`.
+2. **On the client tenant**: the client's **USB Monitoring** toggle must be
+   switched **On** in the RR-IT console's client list. `ingestUsbEvents`
+   checks this server-side on every call, so a device with the checkbox
+   ticked still sends nothing if the tenant hasn't been switched on (and
+   vice versa — the console toggle alone does nothing without the device
+   also being installed with the checkbox ticked).
+
+**What it can and can't tell you** (read `usb_watcher.py`'s header for the
+full reasoning, and say this plainly to the client too): it reliably detects
+a USB drive being connected/disconnected, and files being written to it —
+which covers the actual data-loss scenario most clients care about (someone
+copying company files from the PC onto a USB stick). It does **not** detect
+files copied FROM a USB drive onto the PC — Windows gives no cheap way to
+watch file reads without a kernel driver, well beyond what this script (or
+ActivityWatch itself) does. Don't present "no USB events" as "nothing was
+copied off this machine" without that caveat.
+
+Where it shows up: the client dashboard's Individual drill-down shows a "USB
+removable-drive activity" table for that day, but only for a client with USB
+Monitoring enabled — it's simply not present in the UI for anyone else.
+
+GDPR/consent note: since this is more sensitive than app/website tracking,
+make sure a client's monitoring notice specifically mentions USB monitoring
+before switching it on for them — the standard delivered template doesn't
+call this out by default since it's not part of the default build.
+
 ## Before shipping this to a client
 
 - **aw-watcher-web extension ID** — confirmed and wired in: `nglaklhklhcoonedhgnpgddginnjdadi`,
@@ -98,6 +134,8 @@ or plain Windows Defender, so exclusions need adding for all three:
 
 ```
 pusher/             the ActivityWatch pusher script + its config template
+  aw_pusher.py        always installed — app/website activity
+  usb_watcher.py       optional add-on — USB removable-drive activity
 installer/
   installer.iss      Inno Setup script — the actual installer logic
   staging/            build output lands here (gitignored, created by CI)
