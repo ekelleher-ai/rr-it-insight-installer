@@ -47,6 +47,7 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+import logging.handlers
 import os
 import socket
 import sqlite3
@@ -394,7 +395,11 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
 
 def main() -> None:
     DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handlers: list[logging.Handler] = [logging.FileHandler(DEFAULT_LOG_PATH, encoding="utf-8")]
+    handlers: list[logging.Handler] = [
+            logging.handlers.TimedRotatingFileHandler(
+                DEFAULT_LOG_PATH, when="midnight", backupCount=14, encoding="utf-8"
+            )
+        ]
     if sys.stdout is not None:
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
