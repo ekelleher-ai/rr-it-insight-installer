@@ -526,6 +526,55 @@ begin
 
   Result := Lines;
 end;
+// Called automatically by Inno Setup immediately before it starts copying
+// files — this is its documented hook for stopping a running process that
+// would otherwise hold a lock on a file about to be overwritten.
+//
+// Needed because InstallPusherService's own "nssm stop"/"nssm remove"
+// calls don't run until CurStepChanged's ssPostInstall branch below,
+// which fires AFTER the [Files] copy step — too late to release the lock
+// on nssm.exe. Confirmed live on Test Clint re-running the installer over
+// an existing v2.0.0+ install: the [Files] copy step failed with
+// "DeleteFile failed; code 5. Access is denied" on nssm.exe, because
+// NSSM's Windows Service host process IS nssm.exe itself (not a separate
+// wrapper binary) — while the Pusher service is Running, nssm.exe is a
+// live, locked executable, exactly like any other running .exe Windows
+// won't let you overwrite. Stopping the service here, before extraction
+// begins, releases that lock. InstallPusherService's later stop/remove
+// call in CurStepChanged still runs as normal afterwards — by then it's
+// a harmless no-op (or, on first install, there's no service yet to stop).
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  Nssm: string;
+begin
+  Result := '';
+  Nssm := NssmExePath();
+  if FileExists(Nssm) then
+    Exec(Nssm, 'stop "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+  else
+    // nssm.exe isn't staged into {app} yet on a genuinely fresh install
+    // (nothing to stop). Also try via sc.exe in case the service is still
+    // registered under the Service Control Manager even though {app}\
+    // nssm.exe itself is somehow already gone — belt and braces, and a
+    // harmless no-op if the service doesn't exist either way.
+    Exec(ExpandConstant('{sys}\sc.exe'), 'stop "' + PusherServiceName + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // usb_watcher.exe is also copied by the [Files] section below and is
+  // just as capable of being a currently-running, locked process (as the
+  // USB Watcher Scheduled Task) on a reinstall — same class of bug as
+  // nssm.exe above, so the same belt-and-braces treatment: end the task's
+  // running instance (harmless no-op if the task doesn't exist or isn't
+  // currently running) and taskkill the exe directly as a second attempt,
+  // in case something started it outside the task (shouldn't happen, but
+  // costs nothing to cover).
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN "' + UsbWatcherTaskName + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM usb_watcher.exe',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
