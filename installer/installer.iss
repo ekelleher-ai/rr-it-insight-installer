@@ -333,7 +333,7 @@ begin
   Exec(Nssm, 'stop "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(Nssm, 'remove "' + PusherServiceName + '" confirm', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
-  Exec(Nssm, 'install "' + PusherServiceName + '" "' + AppExe + '" "' + ConfigPath + '"',
+  Exec(Nssm, 'install "' + PusherServiceName + '" "' + AppExe + '" "\"' + ConfigPath + '\""',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(Nssm, 'set "' + PusherServiceName + '" AppDirectory "' + AppDir + '"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
