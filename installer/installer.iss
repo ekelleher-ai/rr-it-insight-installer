@@ -398,6 +398,9 @@ var
   LogPath: string;
   BatPath: string;
   ProgramDataDir: string;
+  PowershellPath: string;
+  Q: string;
+  PsCommand: string;
   BatLines: TArrayOfString;
   ResultCode: Integer;
 begin
@@ -408,13 +411,21 @@ begin
   XmlPath := ProgramDataDir + '\' + TaskName + '.xml';
   LogPath := ProgramDataDir + '\task-registration.log';
   BatPath := ExpandConstant('{tmp}\') + TaskName + '_register.bat';
+  PowershellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Q := '''';
 
   SaveStringsToUTF8File(XmlPath, Lines, False);
+
+  PsCommand := '$ErrorActionPreference=' + Q + 'Stop' + Q + '; try { ' +
+    'Register-ScheduledTask -TaskName ' + Q + TaskName + Q +
+    ' -Xml (Get-Content -LiteralPath ' + Q + XmlPath + Q + ' -Raw) -Force | Out-Null; ' +
+    'Write-Output ' + Q + 'Registered OK' + Q + '; ' +
+    '} catch { Write-Output $_.Exception.Message }';
 
   SetArrayLength(BatLines, 4);
   BatLines[0] := '@echo off';
   BatLines[1] := 'echo ---- %date% %time% : ' + TaskName + ' ---- >> "' + LogPath + '"';
-  BatLines[2] := '"' + ExpandConstant('{sys}\schtasks.exe') + '" /Create /F /TN "' + TaskName + '" /XML "' + XmlPath + '" >> "' + LogPath + '" 2>&1';
+  BatLines[2] := '"' + PowershellPath + '" -NoProfile -ExecutionPolicy Bypass -Command "' + PsCommand + '" >> "' + LogPath + '" 2>&1';
   BatLines[3] := 'echo exit code: %errorlevel% >> "' + LogPath + '"';
   SaveStringsToFile(BatPath, BatLines, False);
 
