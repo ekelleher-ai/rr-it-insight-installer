@@ -466,7 +466,6 @@ begin
   AddXmlLine(Lines, Count, '  <Principals>');
   AddXmlLine(Lines, Count, '    <Principal id="Author">');
   AddXmlLine(Lines, Count, '      <GroupId>' + SidUsersGroup + '</GroupId>');
-  AddXmlLine(Lines, Count, '      <LogonType>Group</LogonType>');
   AddXmlLine(Lines, Count, '      <RunLevel>LeastPrivilege</RunLevel>');
   AddXmlLine(Lines, Count, '    </Principal>');
   AddXmlLine(Lines, Count, '  </Principals>');
@@ -512,7 +511,7 @@ begin
   Count := 0;
   ScriptPath := ExpandConstant('{app}\watchdog.ps1');
 
-  AddXmlLine(Lines, Count, '<?xml version="1.0" >');
+  AddXmlLine(Lines, Count, '<?xml version="1.0"?>');
   AddXmlLine(Lines, Count, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
   AddXmlLine(Lines, Count, '  <RegistrationInfo>');
   AddXmlLine(Lines, Count, '    <Description>RR-IT Insight watchdog. Runs as SYSTEM every 15 minutes and re-enables/restarts the Pusher service and USB Watcher task if something external has disabled them.</Description>');
