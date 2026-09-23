@@ -395,13 +395,31 @@ end;
 procedure RegisterTaskFromXml(const TaskName: string; const Lines: TArrayOfString);
 var
   XmlPath: string;
+  LogPath: string;
+  BatPath: string;
+  ProgramDataDir: string;
+  BatLines: TArrayOfString;
   ResultCode: Integer;
 begin
-  XmlPath := ExpandConstant('{tmp}\') + TaskName + '.xml';
+  ProgramDataDir := ExpandConstant('{commonappdata}\RR-IT Insight');
+  if not DirExists(ProgramDataDir) then
+    CreateDir(ProgramDataDir);
+
+  XmlPath := ProgramDataDir + '\' + TaskName + '.xml';
+  LogPath := ProgramDataDir + '\task-registration.log';
+  BatPath := ExpandConstant('{tmp}\') + TaskName + '_register.bat';
+
   SaveStringsToFile(XmlPath, Lines, False);
-  Exec(ExpandConstant('{sys}\schtasks.exe'),
-    '/Create /F /TN "' + TaskName + '" /XML "' + XmlPath + '"',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  SetArrayLength(BatLines, 4);
+  BatLines[0] := '@echo off';
+  BatLines[1] := 'echo ---- %date% %time% : ' + TaskName + ' ---- >> "' + LogPath + '"';
+  BatLines[2] := '"' + ExpandConstant('{sys}\schtasks.exe') + '" /Create /F /TN "' + TaskName + '" /XML "' + XmlPath + '" >> "' + LogPath + '" 2>&1';
+  BatLines[3] := 'echo exit code: %errorlevel% >> "' + LogPath + '"';
+  SaveStringsToFile(BatPath, BatLines, False);
+
+  Exec(BatPath, '', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  DeleteFile(BatPath);
 end;
 
 // USB Watcher: Users-group principal (S-1-5-32-545) so it runs for
