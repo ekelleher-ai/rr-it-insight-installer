@@ -150,7 +150,57 @@ class Config:
         )
 
 
+def _console_session_username() -> Optional[str]:
+    """Look up the username of whoever is in the active console session via
+    the Windows Terminal Services API. Needed once the pusher runs as a
+    Windows Service under LocalSystem (see installer.iss's
+    InstallPusherService, v2.0.0+) rather than as the logged-in user's own
+    process — in that case getpass.getuser() returns "SYSTEM", not the
+    person actually using the machine, silently breaking event
+    attribution. Returns None on non-Windows, no active console session
+    (e.g. a locked/disconnected machine), or any WTS API failure — callers
+    fall back to getpass.getuser() in that case."""
+    if os.name != "nt":
+        return None
+    try:
+        WTS_CURRENT_SERVER_HANDLE = 0
+        WTS_USER_NAME = 5
+
+        session_id = ctypes.windll.kernel32.WTSGetActiveConsoleSessionId()
+        if session_id in (0xFFFFFFFF, -1):
+            return None  # no one is in the console session right now
+
+        wtsapi32 = ctypes.windll.wtsapi32
+        buf = ctypes.c_void_p()
+        bytes_returned = ctypes.c_ulong()
+        ok = wtsapi32.WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTS_USER_NAME,
+            ctypes.byref(buf),
+            ctypes.byref(bytes_returned),
+        )
+        if not ok or not buf.value:
+            return None
+        try:
+            username = ctypes.wstring_at(buf.value)
+        finally:
+            wtsapi32.WTSFreeMemory(buf)
+        return username or None
+    except Exception:
+        return None
+
+
 def _default_user_name() -> Optional[str]:
+    """Prefer the console session's actual logged-in user — this is the
+    correct behaviour whether the pusher is running interactively (where
+    it and getpass.getuser() agree anyway) or as the LocalSystem Windows
+    Service (where getpass.getuser() would wrongly report "SYSTEM"). Falls
+    back to getpass.getuser() when the WTS lookup can't resolve anyone
+    (e.g. no one's logged on yet, or running on a non-Windows dev box)."""
+    console_user = _console_session_username()
+    if console_user:
+        return console_user
     try:
         return getpass.getuser()
     except Exception:

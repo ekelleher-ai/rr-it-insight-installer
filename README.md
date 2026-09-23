@@ -21,6 +21,53 @@ Actions tab ("Run workflow"). It:
 4. Uploads the finished installer as a workflow artifact — go to the **Actions**
    tab, open the latest run, and download it from there.
 
+## Reliability architecture (v2.0.0+)
+
+A live incident on the "Bowmans x Laptop" pilot machine (tenant "Test Clint")
+found the original Scheduled-Task-based Pusher/USB Watcher unreliable for 5
+separate reasons:
+
+1. A task set to "run only when user is logged on" dies the moment that
+   session ends (logoff, not just a crash).
+2. Switching it to "run whether logged on or not" breaks USB write detection
+   instead — Session-0 isolation means it no longer has the interactive
+   session USB Watcher needs.
+3. The logon trigger doesn't always fire.
+4. The default AC-power condition silently blocks everything on battery, with
+   nothing logged anywhere to say why.
+5. Windows auto-disables a task after enough repeated failures (e.g. during
+   reboot testing), again with no visible alert.
+
+v2.0.0 replaced both components:
+
+- **Pusher → Windows Service.** Installed via bundled **NSSM** rather than a
+  Scheduled Task: starts at boot with nobody logged in, has no power
+  condition, and gets NSSM's own restart-on-exit policy. Diagnose it the
+  normal Windows-service way — `services.msc`, `sc query "RR-IT Insight
+  Pusher"`, or `Get-Service "RR-IT Insight Pusher"` — rather than via Task
+  Scheduler.
+- **USB Watcher → rebuilt Scheduled Task.** Registered from Task XML (not the
+  plain `schtasks /Create /SC ONLOGON` form) with its run-as principal set to
+  the built-in **Users group** (`S-1-5-32-545`) instead of one named account
+  — works for any user who logs on, no per-user install, no stored password
+  — both AC-power conditions explicitly off, and dual logon+boot triggers.
+  Diagnose it via `taskschd.msc` under "RR-IT Insight USB Watcher", same as
+  before.
+- **New Watchdog task.** Runs as SYSTEM every 15 minutes
+  (`installer/watchdog.ps1`, registered as "RR-IT Insight Watchdog") and
+  re-enables/restarts either the Pusher service or the USB Watcher task if
+  something external — an RMM tool, an AV product — disables them. Logs to
+  `C:\ProgramData\RR-IT Insight\watchdog.log`.
+- Upgrading from a pre-2.0.0 install removes the legacy Scheduled-Task-based
+  pusher automatically, on both install and uninstall.
+
+**Still open, not part of this fix:** whether the RMM tool Action1 was the one
+disabling the Scheduled Tasks in the first place hasn't been confirmed — that
+investigation continues separately from this reliability rework.
+
+This should be tested end-to-end on a real Windows machine (ideally the Test
+Clint pilot laptop again) before being relied on for other clients.
+
 ## Diagnosing a client machine
 
 The pusher runs invisibly by design (built with `--noconsole` — a client should
@@ -31,13 +78,23 @@ for repeated "Could not reach local ActivityWatch API" warnings, which usually
 just means ActivityWatch itself isn't running (check for `aw-qt.exe` /
 `aw-server.exe` in Task Manager).
 
+As of v2.0.0, also check the Pusher's own Windows Service status
+(`Get-Service "RR-IT Insight Pusher"`) and `C:\ProgramData\RR-IT
+Insight\watchdog.log` for anything the Watchdog task had to fix recently
+(e.g. "Pusher service was Disabled — re-enabling") — a pattern of repeated
+watchdog interventions on one machine is worth investigating rather than
+just letting the watchdog quietly paper over it every 15 minutes.
+
 ## Uninstalling (client cancels the service)
 
 Uninstalling — from Windows Settings > Apps, or by running `unins000.exe`
 under the install folder — is a **full removal**, not just this app. It asks
 for confirmation, then:
 
-1. Deletes the "RR-IT Insight Pusher" Scheduled Task and kills `aw_pusher.exe`.
+1. Stops and removes the "RR-IT Insight Pusher" Windows Service (via NSSM),
+   deletes the "RR-IT Insight USB Watcher" and "RR-IT Insight Watchdog"
+   Scheduled Tasks, and kills `aw_pusher.exe`/`usb_watcher.exe` if still
+   running.
 2. If confirmed: kills ActivityWatch's processes, runs **ActivityWatch's own
    uninstaller** silently (found wherever it landed, matching the installer's
    own search logic), deletes its Startup-folder shortcut as a backstop, and
@@ -138,6 +195,10 @@ pusher/             the ActivityWatch pusher script + its config template
   usb_watcher.py       optional add-on — USB removable-drive activity
 installer/
   installer.iss      Inno Setup script — the actual installer logic
-  staging/            build output lands here (gitignored, created by CI)
+  watchdog.ps1       re-enables/restarts the Pusher service or USB Watcher
+                       task if something external disables them (v2.0.0+)
+  staging/            build output lands here (gitignored, created by CI —
+                       compiled pusher/usb_watcher exes, the bundled AW
+                       installer, and NSSM)
 .github/workflows/   the Windows-runner build pipeline
 ```

@@ -12,18 +12,28 @@
 ;   3. Copies the compiled pusher (aw_pusher.exe, built by PyInstaller —
 ;      no Python runtime needed on the client machine) into Program Files,
 ;      writing config.json with the Client ID / API key from step 1.
-;   4. Registers a Scheduled Task so the pusher starts at logon and keeps
-;      running, restarting itself if it stops.
+;   4. Installs the pusher as a genuine Windows Service (via bundled NSSM)
+;      so it starts at boot, runs whether or not anyone is logged on, has
+;      no AC-power condition, and restarts itself on any exit — see the
+;      "Reliability architecture (v2.0.0+)" section in README.md for the
+;      incident (a Scheduled-Task-based pusher/USB watcher found unreliable
+;      for 5 separate reasons) that this replaced.
+;   4a. Registers a Watchdog Scheduled Task (SYSTEM, every 15 minutes) that
+;      re-enables/restarts the Pusher service or USB Watcher task if
+;      something external (an RMM tool, an AV product) disables them.
 ;   4b. Adds Windows Defender exclusions for our own folders/processes
 ;      (silent, best-effort — no-op if Defender isn't the active AV).
 ;      COMODO and McAfee need the same done manually — see README.md.
 ;   4c. OPTIONAL, off by default: if the wizard's "USB removable-drive
 ;      monitoring" checkbox is ticked, also registers a Scheduled Task
-;      for usb_watcher.exe — see that script's own header and README.md's
-;      "USB removable-drive monitoring" section for what it does and its
-;      limits. Only tick this for a client who specifically asked for it;
-;      it also still requires this client to be enabled for USB
-;      Monitoring in the RR-IT console before anything is recorded.
+;      for usb_watcher.exe, built from Task XML with the run-as principal
+;      set to the built-in Users group (so it works for any interactively
+;      logged-on user, no per-user install) and no AC-power condition —
+;      see that script's own header and README.md's "USB removable-drive
+;      monitoring" section for what it does and its limits. Only tick this
+;      for a client who specifically asked for it; it also still requires
+;      this client to be enabled for USB Monitoring in the RR-IT console
+;      before anything is recorded.
 ;   5. Force-installs the aw-watcher-web browser extension for BOTH Chrome
 ;      and Edge via the ExtensionInstallForcelist registry policy, so it
 ;      works whichever browser(s) this client's staff actually use —
@@ -46,7 +56,7 @@
 ; cancels the service is left with nothing still running or logging.
 
 #define MyAppName "RR-IT Insight Agent"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "Rapid Response IT"
 #define ExtensionId "nglaklhklhcoonedhgnpgddginnjdadi"
 #define ExtensionUpdateUrl "https://clients2.google.com/service/update2/crx"
@@ -81,9 +91,32 @@ Source: "staging\aw_pusher.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; CurStepChanged below). Shipping it unconditionally is simpler than a
 ; second CI build variant; it just sits unused for clients who don't need it.
 Source: "staging\usb_watcher.exe"; DestDir: "{app}"; Flags: ignoreversion
+; NSSM ("the Non-Sucking Service Manager") — wraps aw_pusher.exe as a real
+; Windows Service. Downloaded and staged by the CI workflow (see
+; build.yml); not committed to the repo.
+Source: "staging\nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Watchdog script — a real source file in this repo (not a build output),
+; so it's referenced directly rather than via staging\.
+Source: "watchdog.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\pusher\config.example.json"; DestDir: "{app}"; DestName: "config.json.template"; Flags: ignoreversion
 
 [Code]
+const
+  // Kept as a named constant even though its string is the same as the
+  // pre-2.0.0 pusher's Scheduled Task name below — this is the OLD task
+  // that upgrades must remove, not the new Service.
+  LegacyPusherTaskName = 'RR-IT Insight Pusher';
+  PusherServiceName = 'RR-IT Insight Pusher';
+  UsbWatcherTaskName = 'RR-IT Insight USB Watcher';
+  WatchdogTaskName = 'RR-IT Insight Watchdog';
+  // Well-known SIDs — used so the USB Watcher task runs for ANY
+  // interactively logged-on user (not one named account) and the Watchdog
+  // task runs as SYSTEM. Only reachable via a Task XML definition — the
+  // plain `schtasks /Create /RU ...` command-line form has no way to name
+  // a group as the run-as principal, only a single named account.
+  SidUsersGroup = 'S-1-5-32-545';
+  SidLocalSystem = 'S-1-5-18';
+
 var
   ConfigPage: TInputQueryWizardPage;
   UsbPage: TInputOptionWizardPage;
@@ -218,6 +251,282 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+// ---------------------------------------------------------------------
+// v2.0.0 reliability rework
+// ---------------------------------------------------------------------
+// Root cause (live incident on the "Bowmans x Laptop" pilot machine,
+// tenant "Test Clint"): the pre-2.0.0 Scheduled-Task-based pusher/USB
+// watcher were unreliable for 5 separate reasons — a "run only when
+// logged on" task dies the moment that session ends; switching to "run
+// whether logged on or not" breaks USB write detection instead (it needs
+// the interactive session); the logon trigger doesn't always fire; the
+// default AC-power condition silently blocks everything on battery with
+// nothing logged; and Windows auto-disables a task after enough repeated
+// failures (e.g. during reboot testing). Fix: the Pusher becomes a real
+// Windows Service (via bundled NSSM — starts at boot with nobody logged
+// in, no power condition, its own restart-on-exit policy); the USB
+// Watcher becomes a Scheduled Task built from Task XML with the built-in
+// Users group as its run-as principal (works for any user who logs on,
+// no per-user install, both power conditions explicitly off, dual
+// logon+boot triggers); and a new Watchdog task (SYSTEM, every 15
+// minutes) re-enables/restarts either one if something external (an RMM
+// tool, an AV product) disables them. See README.md's "Reliability
+// architecture (v2.0.0+)" section and the project's phase-1 progress doc.
+
+function NssmExePath(): string;
+begin
+  Result := ExpandConstant('{app}\nssm.exe');
+end;
+
+// Appends one line to a growable TArrayOfString/Count pair rather than a
+// pre-sized array with manually-computed indices — the array-building
+// functions below were flagged, in an earlier pass at this same fix, as
+// the most likely compile-time failure point precisely because manual
+// SetArrayLength+index bookkeeping is easy to get subtly wrong across a
+// long XML document. Growing by one element per call sidesteps that
+// entirely: there's no length to precompute and no index to miscount.
+procedure AddXmlLine(var Lines: TArrayOfString; var Count: Integer; const S: string);
+begin
+  SetArrayLength(Lines, Count + 1);
+  Lines[Count] := S;
+  Count := Count + 1;
+end;
+
+// Removes the pre-2.0.0 Scheduled-Task-based pusher, if present, before
+// installing the Service — an upgrade from 1.x would otherwise end up
+// with both the old task AND the new service trying to run
+// aw_pusher.exe at the same time.
+procedure RemoveLegacyPusherTask();
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "' + LegacyPusherTaskName + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM aw_pusher.exe',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// Installs (or re-installs, on top of an existing 2.0.0+ install) the
+// Pusher as a genuine Windows Service using the bundled NSSM, which wraps
+// an ordinary console/GUI exe as a proper service: starts at boot with
+// nobody logged in (no Session-0/logon-trigger dependence at all), has no
+// AC-power condition, and gets NSSM's own restart-on-exit policy instead
+// of relying on a Scheduled Task's logon trigger or Windows' own
+// (unconfigurable, silent) task-auto-disable-after-failures behaviour.
+procedure InstallPusherService();
+var
+  ResultCode: Integer;
+  Nssm, AppExe, AppDir, ConfigPath, ProgramDataDir: string;
+begin
+  Nssm := NssmExePath();
+  AppExe := ExpandConstant('{app}\aw_pusher.exe');
+  ConfigPath := ExpandConstant('{app}\config.json');
+  AppDir := ExpandConstant('{app}');
+  ProgramDataDir := ExpandConstant('{commonappdata}\RR-IT Insight');
+  if not DirExists(ProgramDataDir) then
+    CreateDir(ProgramDataDir);
+
+  // Remove any existing service registration first (harmless no-op on a
+  // fresh install) so `nssm install` below doesn't fail on a name that's
+  // already registered — e.g. re-running the installer, or upgrading a
+  // machine that already has 2.0.0+.
+  Exec(Nssm, 'stop "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(Nssm, 'remove "' + PusherServiceName + '" confirm', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  Exec(Nssm, 'install "' + PusherServiceName + '" "' + AppExe + '" "' + ConfigPath + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(Nssm, 'set "' + PusherServiceName + '" AppDirectory "' + AppDir + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(Nssm, 'set "' + PusherServiceName + '" DisplayName "RR-IT Insight Pusher"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(Nssm, 'set "' + PusherServiceName + '" Description "Sends app/website activity to the RR-IT Insight dashboard."',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(Nssm, 'set "' + PusherServiceName + '" Start SERVICE_AUTO_START',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Restart unconditionally on ANY exit (not just crashes) after a short
+  // delay — the equivalent of the old task's "restart if it stops",
+  // without a logon trigger or power condition standing in the way.
+  Exec(Nssm, 'set "' + PusherServiceName + '" AppExit Default Restart',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(Nssm, 'set "' + PusherServiceName + '" AppRestartDelay 5000',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Capture the wrapped exe's own stdout/stderr in case something goes
+  // wrong before its own file logging is even set up (e.g. a bad
+  // config.json at startup).
+  Exec(Nssm, 'set "' + PusherServiceName + '" AppStdout "' + ProgramDataDir + '\service-stdout.log"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(Nssm, 'set "' + PusherServiceName + '" AppStderr "' + ProgramDataDir + '\service-stderr.log"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  Exec(Nssm, 'start "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure RemovePusherService();
+var
+  ResultCode: Integer;
+begin
+  Exec(NssmExePath(), 'stop "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(NssmExePath(), 'remove "' + PusherServiceName + '" confirm', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure RemoveTaskIfExists(const TaskName: string);
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "' + TaskName + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// Writes Lines to a temp XML file and registers it as a Scheduled Task via
+// `schtasks /Create /XML`. This is the only way to reach fields the
+// simple `/SC ONLOGON /RU ...` command-line form can't: in particular,
+// running as the well-known Users GROUP (rather than one named account),
+// and explicitly turning off the AC-power conditions that silently
+// blocked the pre-2.0.0 USB Watcher task on battery with nothing logged
+// anywhere.
+//
+// The XML is written via SaveStringsToFile (plain-text) rather than a
+// Unicode-specific save function: every value that goes into it (task
+// names, SIDs, file paths under {app}, which is always ASCII for this
+// installer) is plain ASCII, so there's no encoding mismatch between the
+// declared `encoding="UTF-8"` in the XML header and the actual bytes on
+// disk — the two known encoding pitfalls with `schtasks /Create /XML`
+// (BOM-less UTF-8 vs UTF-16, and non-ASCII bytes) simply don't apply here.
+procedure RegisterTaskFromXml(const TaskName: string; const Lines: TArrayOfString);
+var
+  XmlPath: string;
+  ResultCode: Integer;
+begin
+  XmlPath := ExpandConstant('{tmp}\') + TaskName + '.xml';
+  SaveStringsToFile(XmlPath, Lines, False);
+  Exec(ExpandConstant('{sys}\schtasks.exe'),
+    '/Create /F /TN "' + TaskName + '" /XML "' + XmlPath + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// USB Watcher: Users-group principal (S-1-5-32-545) so it runs for
+// whichever user is actually logged on (no per-user install, no stored
+// password); both logon and boot triggers (the logon trigger alone
+// doesn't always fire — see the incident notes above); both AC-power
+// conditions explicitly off; ExecutionTimeLimit PT0S (unlimited) since
+// this is a long-running poll loop, not a short task that should be
+// killed after Task Scheduler's default 72-hour ceiling.
+function BuildUsbWatcherTaskXml(): TArrayOfString;
+var
+  Lines: TArrayOfString;
+  Count: Integer;
+  AppExe, ConfigPath: string;
+begin
+  Count := 0;
+  AppExe := ExpandConstant('{app}\usb_watcher.exe');
+  ConfigPath := ExpandConstant('{app}\config.json');
+
+  AddXmlLine(Lines, Count, '<?xml version="1.0" encoding="UTF-8"?>');
+  AddXmlLine(Lines, Count, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
+  AddXmlLine(Lines, Count, '  <RegistrationInfo>');
+  AddXmlLine(Lines, Count, '    <Description>RR-IT Insight USB removable-drive watcher. Runs for any interactively logged-on user (Users group), started at both logon and boot, with no AC-power condition.</Description>');
+  AddXmlLine(Lines, Count, '  </RegistrationInfo>');
+  AddXmlLine(Lines, Count, '  <Triggers>');
+  AddXmlLine(Lines, Count, '    <LogonTrigger>');
+  AddXmlLine(Lines, Count, '      <Enabled>true</Enabled>');
+  AddXmlLine(Lines, Count, '    </LogonTrigger>');
+  AddXmlLine(Lines, Count, '    <BootTrigger>');
+  AddXmlLine(Lines, Count, '      <Enabled>true</Enabled>');
+  AddXmlLine(Lines, Count, '    </BootTrigger>');
+  AddXmlLine(Lines, Count, '  </Triggers>');
+  AddXmlLine(Lines, Count, '  <Principals>');
+  AddXmlLine(Lines, Count, '    <Principal id="Author">');
+  AddXmlLine(Lines, Count, '      <GroupId>' + SidUsersGroup + '</GroupId>');
+  AddXmlLine(Lines, Count, '      <RunLevel>LeastPrivilege</RunLevel>');
+  AddXmlLine(Lines, Count, '    </Principal>');
+  AddXmlLine(Lines, Count, '  </Principals>');
+  AddXmlLine(Lines, Count, '  <Settings>');
+  AddXmlLine(Lines, Count, '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
+  AddXmlLine(Lines, Count, '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>');
+  AddXmlLine(Lines, Count, '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>');
+  AddXmlLine(Lines, Count, '    <AllowHardTerminate>true</AllowHardTerminate>');
+  AddXmlLine(Lines, Count, '    <StartWhenAvailable>true</StartWhenAvailable>');
+  AddXmlLine(Lines, Count, '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>');
+  AddXmlLine(Lines, Count, '    <AllowStartOnDemand>true</AllowStartOnDemand>');
+  AddXmlLine(Lines, Count, '    <Enabled>true</Enabled>');
+  AddXmlLine(Lines, Count, '    <Hidden>false</Hidden>');
+  AddXmlLine(Lines, Count, '    <RunOnlyIfIdle>false</RunOnlyIfIdle>');
+  AddXmlLine(Lines, Count, '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
+  AddXmlLine(Lines, Count, '    <Priority>7</Priority>');
+  AddXmlLine(Lines, Count, '  </Settings>');
+  AddXmlLine(Lines, Count, '  <Actions Context="Author">');
+  AddXmlLine(Lines, Count, '    <Exec>');
+  AddXmlLine(Lines, Count, '      <Command>"' + AppExe + '"</Command>');
+  AddXmlLine(Lines, Count, '      <Arguments>"' + ConfigPath + '"</Arguments>');
+  AddXmlLine(Lines, Count, '    </Exec>');
+  AddXmlLine(Lines, Count, '  </Actions>');
+  AddXmlLine(Lines, Count, '</Task>');
+
+  Result := Lines;
+end;
+
+// Watchdog: SYSTEM principal, fires every 15 minutes starting immediately
+// after registration (StartBoundary is a fixed past date purely so the
+// Repetition interval has a base to count from — combined with the
+// explicit /Run right after registering it, in CurStepChanged, this task
+// doesn't sit idle for up to 15 minutes before its first check).
+// ExecutionTimeLimit PT5M (rather than PT0S/unlimited, unlike the USB
+// Watcher above) because this one really is a short, in-and-out check —
+// bounding it stops a hung run from blocking every future occurrence.
+function BuildWatchdogTaskXml(): TArrayOfString;
+var
+  Lines: TArrayOfString;
+  Count: Integer;
+  ScriptPath: string;
+begin
+  Count := 0;
+  ScriptPath := ExpandConstant('{app}\watchdog.ps1');
+
+  AddXmlLine(Lines, Count, '<?xml version="1.0" encoding="UTF-8"?>');
+  AddXmlLine(Lines, Count, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
+  AddXmlLine(Lines, Count, '  <RegistrationInfo>');
+  AddXmlLine(Lines, Count, '    <Description>RR-IT Insight watchdog. Runs as SYSTEM every 15 minutes and re-enables/restarts the Pusher service and USB Watcher task if something external has disabled them.</Description>');
+  AddXmlLine(Lines, Count, '  </RegistrationInfo>');
+  AddXmlLine(Lines, Count, '  <Triggers>');
+  AddXmlLine(Lines, Count, '    <TimeTrigger>');
+  AddXmlLine(Lines, Count, '      <StartBoundary>2024-01-01T00:00:00</StartBoundary>');
+  AddXmlLine(Lines, Count, '      <Enabled>true</Enabled>');
+  AddXmlLine(Lines, Count, '      <Repetition>');
+  AddXmlLine(Lines, Count, '        <Interval>PT15M</Interval>');
+  AddXmlLine(Lines, Count, '        <StopAtDurationEnd>false</StopAtDurationEnd>');
+  AddXmlLine(Lines, Count, '      </Repetition>');
+  AddXmlLine(Lines, Count, '    </TimeTrigger>');
+  AddXmlLine(Lines, Count, '  </Triggers>');
+  AddXmlLine(Lines, Count, '  <Principals>');
+  AddXmlLine(Lines, Count, '    <Principal id="Author">');
+  AddXmlLine(Lines, Count, '      <UserId>' + SidLocalSystem + '</UserId>');
+  AddXmlLine(Lines, Count, '      <RunLevel>HighestAvailable</RunLevel>');
+  AddXmlLine(Lines, Count, '    </Principal>');
+  AddXmlLine(Lines, Count, '  </Principals>');
+  AddXmlLine(Lines, Count, '  <Settings>');
+  AddXmlLine(Lines, Count, '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
+  AddXmlLine(Lines, Count, '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>');
+  AddXmlLine(Lines, Count, '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>');
+  AddXmlLine(Lines, Count, '    <AllowHardTerminate>true</AllowHardTerminate>');
+  AddXmlLine(Lines, Count, '    <StartWhenAvailable>true</StartWhenAvailable>');
+  AddXmlLine(Lines, Count, '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>');
+  AddXmlLine(Lines, Count, '    <AllowStartOnDemand>true</AllowStartOnDemand>');
+  AddXmlLine(Lines, Count, '    <Enabled>true</Enabled>');
+  AddXmlLine(Lines, Count, '    <Hidden>false</Hidden>');
+  AddXmlLine(Lines, Count, '    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>');
+  AddXmlLine(Lines, Count, '    <Priority>7</Priority>');
+  AddXmlLine(Lines, Count, '  </Settings>');
+  AddXmlLine(Lines, Count, '  <Actions Context="Author">');
+  AddXmlLine(Lines, Count, '    <Exec>');
+  AddXmlLine(Lines, Count, '      <Command>powershell.exe</Command>');
+  AddXmlLine(Lines, Count, '      <Arguments>-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '"</Arguments>');
+  AddXmlLine(Lines, Count, '    </Exec>');
+  AddXmlLine(Lines, Count, '  </Actions>');
+  AddXmlLine(Lines, Count, '</Task>');
+
+  Result := Lines;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
@@ -251,29 +560,34 @@ begin
     AwDir := FindActivityWatchDir();
     AddDefenderExclusions(ExpandConstant('{app}'), AwDir, ExpandConstant('{commonappdata}\RR-IT Insight'));
 
-    // Step 4: Scheduled Task — runs at logon, restarts if it stops.
-    Exec(ExpandConstant('{sys}\schtasks.exe'),
-      '/Create /F /SC ONLOGON /RL HIGHEST /TN "RR-IT Insight Pusher" ' +
-      '/TR "\"' + ExpandConstant('{app}') + '\aw_pusher.exe\" \"' + ExpandConstant('{app}') + '\config.json\""',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    // Also start it immediately for this session, without waiting for next logon.
-    Exec(ExpandConstant('{sys}\schtasks.exe'),
-      '/Run /TN "RR-IT Insight Pusher"',
+    // Step 4: Pusher as a Windows Service (v2.0.0+) — see the "v2.0.0
+    // reliability rework" section above for why this replaced the old
+    // Scheduled Task. Remove any pre-2.0.0 leftover first.
+    RemoveLegacyPusherTask();
+    InstallPusherService();
+
+    // Step 4a: Watchdog — always registered, regardless of whether USB
+    // monitoring is enabled for this client, since it also watches the
+    // (always-installed) Pusher service.
+    RegisterTaskFromXml(WatchdogTaskName, BuildWatchdogTaskXml());
+    Exec(ExpandConstant('{sys}\schtasks.exe'), '/Run /TN "' + WatchdogTaskName + '"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
     // Step 4b: USB watcher — only registered when the wizard checkbox was
     // ticked. usb_watcher.exe is always copied to {app} above, but a
     // client who didn't ask for this gets no Scheduled Task for it at
-    // all, so nothing of it ever runs on their machine.
+    // all, so nothing of it ever runs on their machine. If unticked,
+    // clean up any task left behind by a previous install where it WAS
+    // ticked (e.g. an admin re-running the installer to turn it off).
     if UsbMonitoringEnabled() then
     begin
-      Exec(ExpandConstant('{sys}\schtasks.exe'),
-        '/Create /F /SC ONLOGON /RL HIGHEST /TN "RR-IT Insight USB Watcher" ' +
-        '/TR "\"' + ExpandConstant('{app}') + '\usb_watcher.exe\" \"' + ExpandConstant('{app}') + '\config.json\""',
+      RegisterTaskFromXml(UsbWatcherTaskName, BuildUsbWatcherTaskXml());
+      Exec(ExpandConstant('{sys}\schtasks.exe'), '/Run /TN "' + UsbWatcherTaskName + '"',
         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-      Exec(ExpandConstant('{sys}\schtasks.exe'),
-        '/Run /TN "RR-IT Insight USB Watcher"',
-        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end
+    else
+    begin
+      RemoveTaskIfExists(UsbWatcherTaskName);
     end;
 
     // Step 5: force-install aw-watcher-web for Chrome AND Edge.
@@ -311,16 +625,24 @@ begin
     // Step 1: stop everything before touching files — the pusher first
     // (it's what's actively sending data), then AW's own processes so its
     // uninstaller isn't fighting a running instance.
-    Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "RR-IT Insight Pusher"',
+    //
+    // v2.0.0+: the pusher is a Windows Service, not a Scheduled Task —
+    // stop/remove it via NSSM. The plain schtasks /Delete against the old
+    // task name is kept too (harmless no-op on a 2.0.0+-only install)
+    // in case this is upgrading straight from a pre-2.0.0 install that
+    // somehow still has the legacy task registered.
+    RemovePusherService();
+    Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "' + LegacyPusherTaskName + '"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM aw_pusher.exe',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    // USB watcher — deleting a Scheduled Task/killing a process that was
-    // never created/running (most installs) is a harmless no-op here.
-    Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /F /TN "RR-IT Insight USB Watcher"',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // USB watcher and Watchdog — deleting a Scheduled Task/killing a
+    // process that was never created/running (most installs have no USB
+    // Watcher) is a harmless no-op here.
+    RemoveTaskIfExists(UsbWatcherTaskName);
     Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM usb_watcher.exe',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    RemoveTaskIfExists(WatchdogTaskName);
 
     if RemoveAw = IDYES then
     begin

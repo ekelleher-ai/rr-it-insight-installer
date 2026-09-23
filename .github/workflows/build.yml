@@ -30,6 +30,16 @@ jobs:
         run: |
           pyinstaller --onefile --noconsole --name usb_watcher --distpath installer\staging pusher\usb_watcher.py
 
+      - name: Download NSSM
+        shell: pwsh
+        run: |
+          # NSSM ("the Non-Sucking Service Manager") wraps aw_pusher.exe as
+          # a real Windows Service — see installer.iss's InstallPusherService
+          # for why the pusher moved off Scheduled Tasks in v2.0.0.
+          Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile "$env:RUNNER_TEMP\nssm.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\nssm.zip" -DestinationPath "$env:RUNNER_TEMP\nssm" -Force
+          Copy-Item "$env:RUNNER_TEMP\nssm\nssm-2.24\win64\nssm.exe" -Destination "installer\staging\nssm.exe"
+
       - name: Download latest ActivityWatch Windows installer
         shell: pwsh
         env:
