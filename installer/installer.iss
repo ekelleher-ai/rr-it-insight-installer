@@ -409,7 +409,7 @@ begin
   LogPath := ProgramDataDir + '\task-registration.log';
   BatPath := ExpandConstant('{tmp}\') + TaskName + '_register.bat';
 
-  SaveStringsToFile(XmlPath, Lines, False);
+  SaveStringsToUTF8File(XmlPath, Lines, False);
 
   SetArrayLength(BatLines, 4);
   BatLines[0] := '@echo off';
