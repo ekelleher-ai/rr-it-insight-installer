@@ -437,6 +437,7 @@ begin
   AddXmlLine(Lines, Count, '  <Principals>');
   AddXmlLine(Lines, Count, '    <Principal id="Author">');
   AddXmlLine(Lines, Count, '      <GroupId>' + SidUsersGroup + '</GroupId>');
+  AddXmlLine(Lines, Count, '      <LogonType>Group</LogonType>');
   AddXmlLine(Lines, Count, '      <RunLevel>LeastPrivilege</RunLevel>');
   AddXmlLine(Lines, Count, '    </Principal>');
   AddXmlLine(Lines, Count, '  </Principals>');
