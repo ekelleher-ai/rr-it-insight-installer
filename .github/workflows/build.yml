@@ -3,7 +3,12 @@ name: Build RR-IT Insight installer
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch: {}
+
+# Needed so GITHUB_TOKEN can create the GitHub Release on tag builds.
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -70,3 +75,11 @@ jobs:
           name: RR-IT-Insight-Setup
           path: installer\Output\RR-IT-Insight-Setup.exe
           retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer\Output\RR-IT-Insight-Setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
