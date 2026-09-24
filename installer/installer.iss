@@ -120,8 +120,60 @@ const
 var
   ConfigPage: TInputQueryWizardPage;
   UsbPage: TInputOptionWizardPage;
+  InstallWarnings: string;
+
+// Pulls a "key": "value" string out of a config.json we already wrote
+// ourselves — not a general JSON parser, just enough to read back the two
+// fields we wrote in the exact format WriteConfigFile below produces.
+// Scans character by character so JsonEscape's \" and \\ escapes round-trip
+// correctly (including a value that ends in a backslash).
+function ReadJsonStringValue(const Json, Key: string): string;
+var
+  SearchStr, C: string;
+  P, Len: Integer;
+begin
+  Result := '';
+  SearchStr := '"' + Key + '": "';
+  P := Pos(SearchStr, Json);
+  if P = 0 then Exit;
+  P := P + Length(SearchStr);
+  Len := Length(Json);
+  while P <= Len do
+  begin
+    C := Copy(Json, P, 1);
+    if C = '"' then Exit;
+    if (C = '\') and (P < Len) then
+    begin
+      P := P + 1;
+      C := Copy(Json, P, 1);
+    end;
+    Result := Result + C;
+    P := P + 1;
+  end;
+  // Ran off the end with no closing quote — treat as unreadable.
+  Result := '';
+end;
+
+function ReadJsonBoolValue(const Json, Key: string; DefaultValue: Boolean): Boolean;
+var
+  SearchStr, ValStr: string;
+  StartPos: Integer;
+begin
+  Result := DefaultValue;
+  SearchStr := '"' + Key + '": ';
+  StartPos := Pos(SearchStr, Json);
+  if StartPos = 0 then Exit;
+  StartPos := StartPos + Length(SearchStr);
+  ValStr := Copy(Json, StartPos, 5);
+  if Pos('true', ValStr) = 1 then Result := True
+  else if Pos('false', ValStr) = 1 then Result := False;
+end;
 
 procedure InitializeWizard;
+var
+  ExistingConfigPath, ExistingJson: string;
+  ExistingLines: TArrayOfString;
+  i: Integer;
 begin
   ConfigPage := CreateInputQueryPage(wpSelectDir,
     'RR-IT Insight Configuration',
@@ -143,6 +195,28 @@ begin
     False, False);
   UsbPage.Add('Enable USB removable-drive monitoring on this device');
   UsbPage.Values[0] := False;
+
+  // Reinstall / upgrade: pre-fill from the config.json already on disk so a
+  // re-run (GUI or /VERYSILENT) doesn't blank out working credentials or
+  // silently turn USB monitoring back off. This also fixes the silent-install
+  // case, since /VERYSILENT never sets these Values itself — it uses
+  // whatever they were initialized to here.
+  //
+  // WizardDirValue rather than ExpandConstant('{app}'): {app} isn't
+  // initialized yet during InitializeWizard and expanding it raises a
+  // runtime error that aborts Setup. WizardDirValue is the Select
+  // Destination page's current value, which Setup has already pre-filled
+  // with the previous install's folder on an upgrade.
+  ExistingConfigPath := AddBackslash(WizardDirValue) + 'config.json';
+  if FileExists(ExistingConfigPath) and LoadStringsFromFile(ExistingConfigPath, ExistingLines) then
+  begin
+    ExistingJson := '';
+    for i := 0 to GetArrayLength(ExistingLines) - 1 do
+      ExistingJson := ExistingJson + ExistingLines[i] + #13#10;
+    ConfigPage.Values[0] := ReadJsonStringValue(ExistingJson, 'client_id');
+    ConfigPage.Values[1] := ReadJsonStringValue(ExistingJson, 'api_key');
+    UsbPage.Values[0] := ReadJsonBoolValue(ExistingJson, 'usb_monitoring_enabled', False);
+  end;
 end;
 
 function UsbMonitoringEnabled(): Boolean;
@@ -158,6 +232,13 @@ end;
 function GetApiKey(Param: string): string;
 begin
   Result := ConfigPage.Values[1];
+end;
+
+function JsonEscape(const S: string): string;
+begin
+  Result := S;
+  StringChangeEx(Result, '\', '\\', True);
+  StringChangeEx(Result, '"', '\"', True);
 end;
 
 procedure WriteConfigFile;
@@ -176,8 +257,8 @@ begin
   Lines[0] := '{';
   Lines[1] := '  "aw_api_url": "http://localhost:5600",';
   Lines[2] := '  "zite_ingest_url": "https://2wgpdcmeym.zite.so/api/ingestEvents",';
-  Lines[3] := '  "api_key": "' + ConfigPage.Values[1] + '",';
-  Lines[4] := '  "client_id": "' + ConfigPage.Values[0] + '",';
+  Lines[3] := '  "api_key": "' + JsonEscape(ConfigPage.Values[1]) + '",';
+  Lines[4] := '  "client_id": "' + JsonEscape(ConfigPage.Values[0]) + '",';
   Lines[5] := '  "poll_interval_seconds": 30,';
   Lines[6] := '  "usb_monitoring_enabled": ' + UsbEnabledStr;
   Lines[7] := '}';
@@ -306,6 +387,30 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+// The USB Watcher runs as the logged-on standard user, but this folder is
+// created by the Pusher (a SYSTEM service) and inherits ProgramData's
+// default ACLs, which don't grant standard users write access. Without this,
+// the USB Watcher's own state.sqlite3 / usb_watcher.log writes fail and it
+// exits before its loop ever starts. (OI)(CI) makes it apply to new files
+// and subfolders created here later, not just the folder itself.
+// S-1-5-32-545 is the well-known SID for the built-in Users group, so this
+// doesn't depend on locale-specific group names. The folder is created
+// first because on a fresh install nothing has created it yet at this
+// point, and icacls fails on a path that doesn't exist.
+procedure GrantUsersAccessToProgramData(const Dir: string);
+var
+  ResultCode: Integer;
+begin
+  if not DirExists(Dir) then
+    ForceDirectories(Dir);
+  if not Exec(ExpandConstant('{sys}\icacls.exe'),
+    '"' + Dir + '" /grant *S-1-5-32-545:(OI)(CI)M /T /C',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    InstallWarnings := InstallWarnings +
+      '- Could not grant standard users write access to ' + Dir + ' (icacls exit code ' +
+      IntToStr(ResultCode) + '). The USB Watcher may fail to start for non-admin users.' + #13#10;
+end;
+
 // Installs (or re-installs, on top of an existing 2.0.0+ install) the
 // Pusher as a genuine Windows Service using the bundled NSSM, which wraps
 // an ordinary console/GUI exe as a proper service: starts at boot with
@@ -333,8 +438,10 @@ begin
   Exec(Nssm, 'stop "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(Nssm, 'remove "' + PusherServiceName + '" confirm', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
-  Exec(Nssm, 'install "' + PusherServiceName + '" "' + AppExe + '" "\"' + ConfigPath + '\""',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Exec(Nssm, 'install "' + PusherServiceName + '" "' + AppExe + '" "\"' + ConfigPath + '\""',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    InstallWarnings := InstallWarnings +
+      '- Failed to install the RR-IT Insight Pusher service (nssm exit code ' + IntToStr(ResultCode) + ').' + #13#10;
   Exec(Nssm, 'set "' + PusherServiceName + '" AppDirectory "' + AppDir + '"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(Nssm, 'set "' + PusherServiceName + '" DisplayName "RR-IT Insight Pusher"',
@@ -358,7 +465,9 @@ begin
   Exec(Nssm, 'set "' + PusherServiceName + '" AppStderr "' + ProgramDataDir + '\service-stderr.log"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
-  Exec(Nssm, 'start "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Exec(Nssm, 'start "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    InstallWarnings := InstallWarnings +
+      '- The Pusher service was installed but did not start (nssm exit code ' + IntToStr(ResultCode) + ').' + #13#10;
 end;
 
 procedure RemovePusherService();
@@ -403,12 +512,19 @@ var
   PsCommand: string;
   BatLines: TArrayOfString;
   ResultCode: Integer;
+  LogLines: TArrayOfString;
+  Found: Boolean;
+  i, RunStart: Integer;
 begin
   ProgramDataDir := ExpandConstant('{commonappdata}\RR-IT Insight');
   if not DirExists(ProgramDataDir) then
     CreateDir(ProgramDataDir);
 
-  XmlPath := ProgramDataDir + '\' + TaskName + '.xml';
+  // {tmp}, not ProgramData: {tmp} is a fresh folder owned by the elevated
+  // Setup process and deleted when Setup exits, so a standard user can't
+  // pre-plant or swap the task definition (the Watchdog runs as SYSTEM)
+  // between writing it and registering it.
+  XmlPath := ExpandConstant('{tmp}\') + TaskName + '.xml';
   LogPath := ProgramDataDir + '\task-registration.log';
   BatPath := ExpandConstant('{tmp}\') + TaskName + '_register.bat';
   PowershellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
@@ -431,6 +547,27 @@ begin
 
   Exec(BatPath, '', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   DeleteFile(BatPath);
+
+  // task-registration.log is appended to across every task and every
+  // install, so only look at the lines written by THIS run for THIS task —
+  // i.e. after the last "---- <date> <time> : <TaskName> ----" header —
+  // otherwise an earlier "Registered OK" (from a previous install, or from
+  // the other task) would hide a failure now.
+  Found := False;
+  if LoadStringsFromFile(LogPath, LogLines) then
+  begin
+    RunStart := -1;
+    for i := 0 to GetArrayLength(LogLines) - 1 do
+      if Pos(': ' + TaskName + ' ----', LogLines[i]) > 0 then
+        RunStart := i;
+    if RunStart >= 0 then
+      for i := RunStart + 1 to GetArrayLength(LogLines) - 1 do
+        if Pos('Registered OK', LogLines[i]) > 0 then
+          Found := True;
+  end;
+  if not Found then
+    InstallWarnings := InstallWarnings +
+      '- Failed to register the "' + TaskName + '" scheduled task — see ' + LogPath + #13#10;
 end;
 
 // USB Watcher: Users-group principal (S-1-5-32-545) so it runs for
@@ -614,6 +751,7 @@ begin
   if CurStep = ssPostInstall then
   begin
     WriteConfigFile;
+    GrantUsersAccessToProgramData(ExpandConstant('{commonappdata}\RR-IT Insight'));
 
     // Step 2: silent ActivityWatch install
     Exec(ExpandConstant('{tmp}\activitywatch-setup.exe'),
@@ -673,6 +811,18 @@ begin
       '{#ExtensionId};{#ExtensionUpdateUrl}');
     RegWriteStringValue(HKLM, 'SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist', '1',
       '{#ExtensionId};{#ExtensionUpdateUrl}');
+
+    // SuppressibleMsgBox rather than MsgBox so an unattended
+    // /VERYSILENT /SUPPRESSMSGBOXES install (RMM) never blocks on a dialog;
+    // the same text also goes to Setup's log either way.
+    if InstallWarnings <> '' then
+    begin
+      Log('RR-IT Insight install warnings:' + #13#10 + InstallWarnings);
+      SuppressibleMsgBox('RR-IT Insight installed, but one or more background components did not start correctly:' +
+        #13#10#13#10 + InstallWarnings + #13#10 +
+        'Please contact RR-IT support with this message before relying on this device''s monitoring.',
+        mbError, MB_OK, IDOK);
+    end;
   end;
 end;
 
