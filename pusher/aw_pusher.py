@@ -40,7 +40,7 @@ import sys
 import time
 import getpass
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -347,15 +347,49 @@ class AWClient:
         return r.json()
 
     def get_events(self, bucket_id: str, start_iso: Optional[str], limit: int) -> list[dict]:
-        params = {"limit": limit}
-        if start_iso:
-            params["start"] = start_iso
-        r = self.session.get(
-            f"{self.base_url}/api/0/buckets/{bucket_id}/events", params=params, timeout=15
-        )
-        r.raise_for_status()
-        # AW returns newest-first; we want oldest-first so watermarks advance monotonically.
-        events = r.json()
+        """Fetch every event from start_iso onward, oldest-first.
+
+        AW's /events endpoint always returns its NEWEST `limit` events
+        matching the filter, truncated server-side — so a single call with
+        `start=<watermark>` silently drops anything older than the newest
+        `limit` events if more than `limit` have queued up since the
+        watermark (e.g. after downtime). To backfill correctly we walk
+        backward from "now" using `end` as a cursor: each page's oldest
+        timestamp becomes the next page's exclusive upper bound, so we
+        keep paging until a page comes back smaller than the page size,
+        which means we've reached (or passed) start_iso with nothing left
+        in between.
+        """
+        page_size = min(limit, 1000) if limit else 1000
+        collected: dict = {}
+        end_iso: Optional[str] = None
+        while True:
+            params = {"limit": page_size}
+            if start_iso:
+                params["start"] = start_iso
+            if end_iso:
+                params["end"] = end_iso
+            r = self.session.get(
+                f"{self.base_url}/api/0/buckets/{bucket_id}/events", params=params, timeout=15
+            )
+            r.raise_for_status()
+            page = r.json()
+            if not page:
+                break
+            for e in page:
+                collected[e["id"]] = e
+            if len(page) < page_size:
+                # This page covered everything between start_iso and end_iso
+                # (or now, if end_iso is unset) — nothing older is missing.
+                break
+            page.sort(key=lambda e: e["timestamp"])
+            oldest_ts = page[0]["timestamp"]
+            if oldest_ts == end_iso:
+                # Not making progress (a full page all sharing one
+                # timestamp) — stop rather than loop forever.
+                break
+            end_iso = oldest_ts
+        events = list(collected.values())
         events.sort(key=lambda e: e["timestamp"])
         return events
 
@@ -465,11 +499,18 @@ def dedupe_growing_events(
         ts = e["timestamp"]
         duration = float(e.get("duration", 0))
         if last_ts is not None and ts == last_ts:
-            delta = duration - sent
+            sent_before = sent
+            delta = duration - sent_before
             sent = duration
             if delta <= 0:
                 continue  # AW returned it unchanged — nothing new to send
-            e = {**e, "duration": delta}
+            # The delta covers the seconds AFTER what we already sent, so it
+            # starts `sent_before` seconds into the original event, not at
+            # the event's original start — otherwise AFK-overlap and
+            # web-domain checks look at the wrong slice of time for any
+            # window that's been open a while.
+            shifted_start = _parse_ts(ts) + timedelta(seconds=sent_before)
+            e = {**e, "timestamp": shifted_start.isoformat(), "duration": delta}
         else:
             sent = duration
         last_ts = ts
@@ -485,7 +526,7 @@ def transform_window_events(
     out = []
     for e in window_events:
         data = e.get("data", {})
-        app = data.get("app", "unknown")
+        app = data.get("app") or "unknown"
         title = data.get("title", "")
         start = _parse_ts(e["timestamp"])
         duration_s = float(e.get("duration", 0))
@@ -518,11 +559,20 @@ def transform_window_events(
 # Send loop
 # --------------------------------------------------------------------------
 
+_outbox_backoff_seconds = 1
+_outbox_next_attempt_at = 0.0
+
 def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> None:
-    backoff = 1
+    global _outbox_backoff_seconds, _outbox_next_attempt_at
+
+    now = time.monotonic()
+    if now < _outbox_next_attempt_at:
+        return  # still inside the backoff window from a previous failure
+
     while True:
         batch = state.peek_batch(SEND_BATCH_SIZE)
         if not batch:
+            _outbox_backoff_seconds = 1  # caught up — reset for the next failure
             return
 
         # Zite's app endpoints expect the actual arguments wrapped under an
@@ -550,29 +600,55 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
         try:
             r = session.post(cfg.zite_ingest_url, json=payload, timeout=30)
         except requests.RequestException as exc:
-            log.warning("Ingest POST failed (network): %s — will retry", exc)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
-            return  # stop this flush cycle; next poll cycle will retry
+            log.warning(
+                "Ingest POST failed (network): %s — will retry in %ss",
+                exc, _outbox_backoff_seconds,
+            )
+            _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
+            _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
+            return
 
         if r.status_code == 200:
             state.delete_ids([row["id"] for row in batch])
-            backoff = 1
             log.info("Pushed %d events (outbox now %d)", len(batch), state.outbox_size())
-            continue  # keep draining if more remain
+            continue
 
         if r.status_code in (401, 403):
             log.error(
-                "Ingest rejected the request (%s): %s — check api_key/client_id/tenant status. "
-                "Leaving events queued.",
-                r.status_code,
-                r.text[:300],
+                "Ingest rejected the request (%s): %s — check api_key/client_id. Leaving events queued.",
+                r.status_code, r.text[:300],
             )
+            _outbox_next_attempt_at = time.monotonic() + MAX_BACKOFF_SECONDS
             return
 
-        log.warning("Ingest returned %s: %s — will retry", r.status_code, r.text[:300])
-        time.sleep(backoff)
-        backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+        if r.status_code in (400, 413, 422):
+            # The server is telling us THIS batch is invalid in a way that
+            # retrying won't fix (malformed, too large, unprocessable).
+            # Retrying forever just blocks every event queued behind it, so
+            # drop this one batch and keep going with the rest. This does
+            # mean genuinely-malformed events are lost rather than retried
+            # forever — a deliberate trade-off over an outbox that can never
+            # drain.
+            #
+            # 404 is deliberately NOT in this list: it means the ingest URL
+            # itself is wrong or the endpoint is temporarily unpublished — a
+            # config/server problem, not a bad batch — and dropping on it
+            # would delete the entire outbox one batch at a time. It falls
+            # through to the retry-with-backoff path below instead.
+            log.error(
+                "Ingest rejected a batch of %d events (%s): %s — dropping this "
+                "batch so later events aren't blocked. First event timestamp: %s",
+                len(batch), r.status_code, r.text[:300], batch[0]["timestamp_iso"],
+            )
+            state.delete_ids([row["id"] for row in batch])
+            continue
+
+        log.warning(
+            "Ingest returned %s: %s — will retry in %ss",
+            r.status_code, r.text[:300], _outbox_backoff_seconds,
+        )
+        _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
+        _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
         return
 
 
@@ -631,20 +707,27 @@ def main() -> None:
     )
     log = logging.getLogger("aw_pusher")
 
-    if not acquire_single_instance_lock():
-        log.info(
-            "Another copy of the pusher is already running on this machine "
-            "— exiting immediately rather than running a second, "
-            "independent copy."
-        )
-        return
+    try:
+        if not acquire_single_instance_lock():
+            log.info(
+                "Another copy of the pusher is already running on this machine "
+                "— exiting immediately rather than running a second, "
+                "independent copy."
+            )
+            return
 
-    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG_PATH
-    cfg = Config.load(config_path)
-    DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state = State(DEFAULT_STATE_DIR / "state.sqlite3")
-    session = requests.Session()
-    aw = AWClient(cfg.aw_api_url, session)
+        config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG_PATH
+        cfg = Config.load(config_path)
+        DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        state = State(DEFAULT_STATE_DIR / "state.sqlite3")
+        session = requests.Session()
+        aw = AWClient(cfg.aw_api_url, session)
+    except (Exception, SystemExit):
+        # SystemExit too: Config.load() raises it (not an Exception
+        # subclass) for a missing config.json, and that's exactly the
+        # startup failure most worth getting into pusher.log.
+        log.exception("Fatal error during startup — exiting")
+        return
 
     log.info(
         "RR-IT Insight pusher starting — host=%s client=%s aw=%s -> %s",
