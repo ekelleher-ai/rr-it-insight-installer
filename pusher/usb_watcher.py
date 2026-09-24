@@ -350,8 +350,15 @@ MAX_PRE_CONSENT_QUEUE_AGE_HOURS = 24
 _usb_outbox_backoff_seconds = 1
 _usb_outbox_next_attempt_at = 0.0
 
+# See aw_pusher.py's MAX_BAD_BATCH_RETRY_SECONDS: a 400/413/422 is retried
+# for up to 24h after the batch's first rejection before it's dropped, since
+# a temporary server-side fault returns the same 400 as a malformed batch.
+MAX_BAD_BATCH_RETRY_SECONDS = 24 * 3600
+_usb_outbox_rejected_head_id = None
+_usb_outbox_rejected_since = 0.0
+
 def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> None:
-    global _usb_outbox_backoff_seconds, _usb_outbox_next_attempt_at
+    global _usb_outbox_backoff_seconds, _usb_outbox_next_attempt_at, _usb_outbox_rejected_head_id, _usb_outbox_rejected_since
 
     now = time.monotonic()
     if now < _usb_outbox_next_attempt_at:
@@ -397,6 +404,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
 
         if r.status_code == 200:
             state.delete_ids([row["id"] for row in batch])
+            _usb_outbox_rejected_head_id = None
             log.info("Pushed %d USB events (outbox now %d)", len(batch), state.outbox_size())
             continue
 
@@ -427,15 +435,30 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
             return
 
         if r.status_code in (400, 413, 422):
-            # 404 deliberately excluded — see aw_pusher.py's flush_outbox:
-            # a wrong/unpublished endpoint is a config problem, and dropping
-            # on it would empty the whole outbox one batch at a time.
+            # 404 deliberately excluded — see aw_pusher.py's flush_outbox.
+            head_id = batch[0]["id"]
+            if head_id != _usb_outbox_rejected_head_id:
+                _usb_outbox_rejected_head_id = head_id
+                _usb_outbox_rejected_since = time.monotonic()
+            rejected_for = time.monotonic() - _usb_outbox_rejected_since
+            if rejected_for < MAX_BAD_BATCH_RETRY_SECONDS:
+                log.warning(
+                    "USB ingest rejected a batch of %d events (%s): %s — retrying in %ss "
+                    "(rejected for %dm so far; dropped only after %dh of continuous "
+                    "rejection, in case this is a temporary server-side fault).",
+                    len(batch), r.status_code, r.text[:300], _usb_outbox_backoff_seconds,
+                    rejected_for // 60, MAX_BAD_BATCH_RETRY_SECONDS // 3600,
+                )
+                _usb_outbox_next_attempt_at = time.monotonic() + _usb_outbox_backoff_seconds
+                _usb_outbox_backoff_seconds = min(_usb_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
+                return
             log.error(
-                "USB ingest rejected a batch of %d events (%s): %s — dropping this "
-                "batch so later events aren't blocked.",
-                len(batch), r.status_code, r.text[:300],
+                "USB ingest has rejected the same batch of %d events (%s) continuously "
+                "for %dh: %s — dropping it so later events aren't blocked forever.",
+                len(batch), r.status_code, MAX_BAD_BATCH_RETRY_SECONDS // 3600, r.text[:300],
             )
             state.delete_ids([row["id"] for row in batch])
+            _usb_outbox_rejected_head_id = None
             continue
 
         log.warning(

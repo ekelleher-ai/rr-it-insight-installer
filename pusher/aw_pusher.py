@@ -562,8 +562,16 @@ def transform_window_events(
 _outbox_backoff_seconds = 1
 _outbox_next_attempt_at = 0.0
 
+# A batch rejected with 400/413/422 is retried (with the normal backoff) for
+# this long after its FIRST rejection before it's dropped. A 400 can mean a
+# genuinely malformed batch OR a temporary server-side bug, and the two look
+# identical from here, so a single rejection must never be treated as final.
+MAX_BAD_BATCH_RETRY_SECONDS = 24 * 3600
+_outbox_rejected_head_id = None      # id of the first row of the batch currently being rejected
+_outbox_rejected_since = 0.0         # time.monotonic() of that batch's first rejection
+
 def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> None:
-    global _outbox_backoff_seconds, _outbox_next_attempt_at
+    global _outbox_backoff_seconds, _outbox_next_attempt_at, _outbox_rejected_head_id, _outbox_rejected_since
 
     now = time.monotonic()
     if now < _outbox_next_attempt_at:
@@ -610,6 +618,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
 
         if r.status_code == 200:
             state.delete_ids([row["id"] for row in batch])
+            _outbox_rejected_head_id = None
             log.info("Pushed %d events (outbox now %d)", len(batch), state.outbox_size())
             continue
 
@@ -622,25 +631,37 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
             return
 
         if r.status_code in (400, 413, 422):
-            # The server is telling us THIS batch is invalid in a way that
-            # retrying won't fix (malformed, too large, unprocessable).
-            # Retrying forever just blocks every event queued behind it, so
-            # drop this one batch and keep going with the rest. This does
-            # mean genuinely-malformed events are lost rather than retried
-            # forever — a deliberate trade-off over an outbox that can never
-            # drain.
-            #
             # 404 is deliberately NOT in this list: it means the ingest URL
             # itself is wrong or the endpoint is temporarily unpublished — a
-            # config/server problem, not a bad batch — and dropping on it
-            # would delete the entire outbox one batch at a time. It falls
-            # through to the retry-with-backoff path below instead.
+            # config/server problem, not a bad batch. It falls through to the
+            # plain retry-with-backoff path below.
+            head_id = batch[0]["id"]
+            if head_id != _outbox_rejected_head_id:
+                _outbox_rejected_head_id = head_id
+                _outbox_rejected_since = time.monotonic()
+            rejected_for = time.monotonic() - _outbox_rejected_since
+            if rejected_for < MAX_BAD_BATCH_RETRY_SECONDS:
+                log.warning(
+                    "Ingest rejected a batch of %d events (%s): %s — retrying in %ss "
+                    "(rejected for %dm so far; dropped only after %dh of continuous "
+                    "rejection, in case this is a temporary server-side fault). "
+                    "First event timestamp: %s",
+                    len(batch), r.status_code, r.text[:300], _outbox_backoff_seconds,
+                    rejected_for // 60, MAX_BAD_BATCH_RETRY_SECONDS // 3600,
+                    batch[0]["timestamp_iso"],
+                )
+                _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
+                _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
+                return
             log.error(
-                "Ingest rejected a batch of %d events (%s): %s — dropping this "
-                "batch so later events aren't blocked. First event timestamp: %s",
-                len(batch), r.status_code, r.text[:300], batch[0]["timestamp_iso"],
+                "Ingest has rejected the same batch of %d events (%s) continuously for "
+                "%dh: %s — dropping it so later events aren't blocked forever. "
+                "First event timestamp: %s",
+                len(batch), r.status_code, MAX_BAD_BATCH_RETRY_SECONDS // 3600,
+                r.text[:300], batch[0]["timestamp_iso"],
             )
             state.delete_ids([row["id"] for row in batch])
+            _outbox_rejected_head_id = None
             continue
 
         log.warning(
