@@ -520,7 +520,17 @@ def main() -> None:
                 if new_events:
                     log.info("%d new/changed file(s) written to %s", len(new_events), info["name"])
                     state.enqueue(new_events)
-                info["files"] = current_files
+                # Merge rather than replace: on a drive over MAX_FILES_PER_DRIVE_SCAN,
+                # scan_drive() only returns a partial snapshot, and os.walk's traversal
+                # order can shift slightly between polls (files added/removed elsewhere
+                # on the drive). Overwriting the baseline with just this cycle's partial
+                # scan would forget any file that isn't rescanned this time, causing it
+                # to be reported as "new" all over again the next time it IS rescanned.
+                # Merging keeps every previously-known file's last-seen state unless
+                # this cycle's scan actually saw (and possibly updated) it.
+                merged_baseline = dict(info["files"])
+                merged_baseline.update(current_files)
+                info["files"] = merged_baseline
 
         except Exception:
             log.exception("Unexpected error during USB scan — continuing")
