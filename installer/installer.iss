@@ -818,8 +818,10 @@ begin
     if InstallWarnings <> '' then
     begin
       Log('RR-IT Insight install warnings:' + #13#10 + InstallWarnings);
-      SuppressibleMsgBox('RR-IT Insight installed, but one or more background components did not start correctly:' +
-        #13#10#13#10 + InstallWarnings + #13#10 +
+      // (No continuation line may START with #13#10: Inno's preprocessor
+      // treats any line whose first non-blank character is # as a directive.)
+      SuppressibleMsgBox('RR-IT Insight installed, but one or more background components did not start correctly:' + #13#10#13#10 +
+        InstallWarnings + #13#10 +
         'Please contact RR-IT support with this message before relying on this device''s monitoring.',
         mbError, MB_OK, IDOK);
     end;
