@@ -55,7 +55,7 @@ import sys
 import time
 import getpass
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -237,6 +237,13 @@ class State:
     def outbox_size(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM usb_outbox").fetchone()[0]
 
+    def delete_older_than(self, cutoff_iso: str) -> int:
+        cur = self.conn.execute(
+            "DELETE FROM usb_outbox WHERE queued_at_iso < ?", (cutoff_iso,)
+        )
+        self.conn.commit()
+        return cur.rowcount
+
 
 # --------------------------------------------------------------------------
 # Drive detection (Windows API via ctypes — no extra pip dependency)
@@ -338,11 +345,22 @@ def scan_drive(drive_letter: str, log: logging.Logger) -> dict[str, tuple[float,
 # Send loop — same shape as aw_pusher.py's flush_outbox
 # --------------------------------------------------------------------------
 
+MAX_PRE_CONSENT_QUEUE_AGE_HOURS = 24
+
+_usb_outbox_backoff_seconds = 1
+_usb_outbox_next_attempt_at = 0.0
+
 def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> None:
-    backoff = 1
+    global _usb_outbox_backoff_seconds, _usb_outbox_next_attempt_at
+
+    now = time.monotonic()
+    if now < _usb_outbox_next_attempt_at:
+        return
+
     while True:
         batch = state.peek_batch(SEND_BATCH_SIZE)
         if not batch:
+            _usb_outbox_backoff_seconds = 1
             return
 
         payload = {
@@ -369,27 +387,63 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
         try:
             r = session.post(cfg.zite_usb_ingest_url, json=payload, timeout=30)
         except requests.RequestException as exc:
-            log.warning("USB ingest POST failed (network): %s — will retry", exc)
-            time.sleep(backoff)
+            log.warning(
+                "USB ingest POST failed (network): %s — will retry in %ss",
+                exc, _usb_outbox_backoff_seconds,
+            )
+            _usb_outbox_next_attempt_at = time.monotonic() + _usb_outbox_backoff_seconds
+            _usb_outbox_backoff_seconds = min(_usb_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
             return
 
         if r.status_code == 200:
             state.delete_ids([row["id"] for row in batch])
-            backoff = 1
             log.info("Pushed %d USB events (outbox now %d)", len(batch), state.outbox_size())
             continue
 
         if r.status_code in (401, 403):
             log.error(
                 "USB ingest rejected the request (%s): %s — check api_key/client_id, "
-                "and that USB Monitoring is enabled for this client. Leaving events queued.",
+                "and that USB Monitoring is enabled for this client.",
                 r.status_code, r.text[:300],
             )
+            # Don't retain rejected USB activity indefinitely: if this
+            # client's USB monitoring is simply off (or the key was
+            # revoked), queuing forever means a flood of pre-consent
+            # activity uploads the moment it's switched on later. Drop
+            # anything that's been sitting here more than
+            # MAX_PRE_CONSENT_QUEUE_AGE_HOURS instead.
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=MAX_PRE_CONSENT_QUEUE_AGE_HOURS)
+            ).isoformat()
+            dropped = state.delete_older_than(cutoff)
+            if dropped:
+                log.warning(
+                    "Discarded %d queued USB events older than %dh while ingest is "
+                    "rejected — not retaining USB activity indefinitely without "
+                    "confirmed consent/config.",
+                    dropped, MAX_PRE_CONSENT_QUEUE_AGE_HOURS,
+                )
+            _usb_outbox_next_attempt_at = time.monotonic() + MAX_BACKOFF_SECONDS
             return
 
-        log.warning("USB ingest returned %s: %s — will retry", r.status_code, r.text[:300])
-        time.sleep(backoff)
-        backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+        if r.status_code in (400, 413, 422):
+            # 404 deliberately excluded — see aw_pusher.py's flush_outbox:
+            # a wrong/unpublished endpoint is a config problem, and dropping
+            # on it would empty the whole outbox one batch at a time.
+            log.error(
+                "USB ingest rejected a batch of %d events (%s): %s — dropping this "
+                "batch so later events aren't blocked.",
+                len(batch), r.status_code, r.text[:300],
+            )
+            state.delete_ids([row["id"] for row in batch])
+            continue
+
+        log.warning(
+            "USB ingest returned %s: %s — will retry in %ss",
+            r.status_code, r.text[:300], _usb_outbox_backoff_seconds,
+        )
+        _usb_outbox_next_attempt_at = time.monotonic() + _usb_outbox_backoff_seconds
+        _usb_outbox_backoff_seconds = min(_usb_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
         return
 
 
@@ -409,29 +463,34 @@ def main() -> None:
     )
     log = logging.getLogger("usb_watcher")
 
-    if not acquire_single_instance_lock():
-        log.info(
-            "Another copy of the USB watcher is already running on this "
-            "machine — exiting immediately rather than running a second, "
-            "independent copy (which would double up every event)."
-        )
+    try:
+        if not acquire_single_instance_lock():
+            log.info(
+                "Another copy of the USB watcher is already running on this "
+                "machine — exiting immediately rather than running a second, "
+                "independent copy (which would double up every event)."
+            )
+            return
+
+        config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG_PATH
+        cfg = Config.load(config_path)
+
+        if not cfg.usb_monitoring_enabled:
+            # Belt-and-braces: even if this exe somehow got run on a machine
+            # where the installer's USB checkbox wasn't ticked, do nothing
+            # rather than silently start watching. The Scheduled Task that
+            # launches this is itself only created when the checkbox was
+            # ticked, so reaching this line at all should be rare.
+            log.info("USB monitoring is not enabled in config.json — exiting without watching anything.")
+            return
+
+        DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        state = State(DEFAULT_STATE_DIR / "state.sqlite3")
+        session = requests.Session()
+    except (Exception, SystemExit):
+        # SystemExit too: Config.load() raises it for a missing config.json.
+        log.exception("Fatal error during startup — exiting")
         return
-
-    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONFIG_PATH
-    cfg = Config.load(config_path)
-
-    if not cfg.usb_monitoring_enabled:
-        # Belt-and-braces: even if this exe somehow got run on a machine
-        # where the installer's USB checkbox wasn't ticked, do nothing
-        # rather than silently start watching. The Scheduled Task that
-        # launches this is itself only created when the checkbox was
-        # ticked, so reaching this line at all should be rare.
-        log.info("USB monitoring is not enabled in config.json — exiting without watching anything.")
-        return
-
-    DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state = State(DEFAULT_STATE_DIR / "state.sqlite3")
-    session = requests.Session()
 
     log.info(
         "RR-IT Insight USB watcher starting — host=%s client=%s -> %s",
