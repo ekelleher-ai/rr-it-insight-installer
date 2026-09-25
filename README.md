@@ -167,11 +167,35 @@ copied off this machine" without that caveat.
 (which Windows reports as "removable"), plus external USB hard drives and
 SSDs (which Windows reports as "fixed", like an internal disk — before
 v2.0.0.12 these were silently ignored). Internal disks and the Windows
-system drive are never watched. Two things to know: a USB hard drive left
-permanently plugged in (e.g. a desk backup drive) will report every file
-backup software writes to it; and on a drive with more than 20,000 files
-the scan stops early each cycle, so writes into the unscanned part of the
-drive can be missed (`usb_watcher.log` says when this happens).
+system drive are never watched.
+
+**Scanning schedule** (v2.0.0.13+): flash drives and SD cards are fully
+scanned every 15 seconds, as before. External USB hard drives and SSDs are
+checked every 15 seconds with a cheap free-space read that doesn't wake an
+idle drive: if free space has changed at all, the drive is scanned straight
+away, so ordinary copying (which always uses space) is still caught within
+about 15 seconds, including a quick copy-then-unplug. On top of that they get
+a full scan at least every 2 minutes, which catches the rare writes that
+leave free space unchanged (a same-size overwrite, a delete and a copy that
+cancel out, very small files). A permanently-connected backup drive is
+therefore walked every 2 minutes rather than every 15 seconds; it still
+wakes periodically, so it won't sleep for long stretches.
+
+**Very large drives**: a drive is enumerated up to 100,000 files / 20 seconds
+per scan. On a drive bigger than that the file list is incomplete, so — to
+avoid falsely reporting files that were already there — such a drive only
+reports a file as written when its creation or modified time is at/after the
+moment monitoring started. Creation time is what catches a copy: Windows
+gives a copied file a new creation time but keeps the original's modified
+time. `usb_watcher.log` notes when a drive is too large to enumerate fully.
+
+**USB4 / Thunderbolt NVMe enclosures**: these can report their bus as NVMe
+rather than USB, and are *not* auto-detected — an internal system NVMe disk
+reports the same bus, and watching an internal disk would log everything the
+user does locally. For the rare client with such an enclosure, add its drive
+letter to an opt-in `extra_watch_drives` list in that device's `config.json`,
+e.g. `"extra_watch_drives": ["G:"]`. The system drive is never watched even
+if listed there by mistake.
 
 Where it shows up: the client dashboard's Individual drill-down shows a "USB
 removable-drive activity" table for that day, but only for a client with USB
