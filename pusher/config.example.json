@@ -4,5 +4,6 @@
   "api_key": "PASTE-CLIENT-INGEST-KEY-HERE",
   "client_id": "PASTE-CLIENT-ID-HERE",
   "poll_interval_seconds": 30,
-  "usb_monitoring_enabled": false
+  "usb_monitoring_enabled": false,
+  "extra_watch_drives": []
 }

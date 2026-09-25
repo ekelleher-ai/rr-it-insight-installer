@@ -83,7 +83,47 @@ DEFAULT_LOG_PATH = _DATA_DIR / "usb_watcher.log"
 POLL_INTERVAL_SECONDS = 15   # how often to re-check drives and re-scan for new files
 SEND_BATCH_SIZE = 200
 MAX_BACKOFF_SECONDS = 300
-MAX_FILES_PER_DRIVE_SCAN = 20000  # safety cap so a huge drive can't hang a poll cycle
+# Safety limits so a huge drive can't hang a poll cycle. A scan stops at
+# whichever comes first: the file cap or the wall-clock budget. The cap is
+# generous enough that the vast majority of real drives enumerate fully
+# (giving a COMPLETE baseline — see the connect handler and find_written_files),
+# and the time budget is the real backstop for a pathologically large one.
+MAX_FILES_PER_DRIVE_SCAN = 100000
+SCAN_TIME_BUDGET_SECONDS = 20
+
+# When a drive's baseline scan was truncated (too many files to enumerate
+# fully — see above), the per-file "is this new" comparison can't be trusted
+# on its own: a pre-existing file beyond the cap that a later scan happens to
+# reach would look new purely because it wasn't in the (incomplete) baseline.
+# For a truncated-baseline drive ONLY, a file is therefore reported as
+# written only when its CREATION time (or its modified time) is at/after the
+# moment monitoring started, minus this margin to tolerate filesystem/clock
+# skew (FAT/exFAT store timestamps in local time).
+#
+# Creation time is the one that matters: when Windows copies a file onto a
+# drive, the copy gets a NEW creation time (the moment of the copy) but KEEPS
+# the source file's old modified time. Checking modified time alone would
+# therefore ignore a genuinely copied file — caught in review before release.
+# Modified time is still checked too, so an existing file edited in place is
+# reported. A pre-existing file has both timestamps old, so it's never
+# mis-reported. Not used for a complete baseline, where every pre-existing
+# file is already known by name.
+TRUNCATED_BASELINE_TIME_MARGIN_SECONDS = 4 * 3600
+
+# External USB hard drives/SSDs (DRIVE_FIXED volumes, plus anything in
+# extra_watch_drives) can be large, and walking every file on one every 15
+# seconds keeps a spinning drive permanently busy. For those drives only:
+#   - every cycle, a cheap free-space read (doesn't wake an idle drive); if
+#     free space has changed at all, scan straight away — ordinary copying
+#     always changes free space, so a quick copy-then-unplug is still caught
+#     within one cycle, same as before;
+#   - regardless, a full scan at least every FIXED_DRIVE_FULL_SCAN_SECONDS,
+#     which catches the rare writes that leave free space unchanged (a
+#     same-size overwrite, a delete and a copy that cancel out within one
+#     cycle, very small files stored inside the NTFS file table).
+# Flash drives and SD cards (DRIVE_REMOVABLE) are small and don't spin, so
+# they keep a full scan every cycle, unchanged.
+FIXED_DRIVE_FULL_SCAN_SECONDS = 120
 
 # How long a drive can vanish and reappear before we treat it as a genuinely
 # new connect/disconnect. Some setups make a drive blip on and off within a
@@ -148,6 +188,10 @@ class Config:
     usb_monitoring_enabled: bool
     hostname: str
     user_name: Optional[str]
+    # Optional, opt-in list of extra drive letters to watch that auto-detection
+    # can't safely catch (a USB4/Thunderbolt NVMe enclosure reporting an NVMe
+    # bus). Empty for almost every device. See list_removable_drives().
+    extra_watch_drives: list[str]
 
     @staticmethod
     def load(path: Path) -> "Config":
@@ -166,6 +210,11 @@ class Config:
             usb_monitoring_enabled=bool(raw.get("usb_monitoring_enabled", False)),
             hostname=raw.get("hostname") or socket.gethostname(),
             user_name=raw.get("user_name") or _default_user_name(),
+            extra_watch_drives=(
+                raw.get("extra_watch_drives")
+                if isinstance(raw.get("extra_watch_drives"), list)
+                else []
+            ),
         )
 
 
@@ -338,24 +387,55 @@ def _system_drive_letter() -> str:
     return (os.environ.get("SystemDrive") or "C:").rstrip("\\").upper() + "\\"
 
 
-def list_removable_drives() -> list[str]:
+def _normalize_drive_letter(value: str) -> Optional[str]:
+    """Turn 'g', 'G', 'G:', 'G:\\' into the canonical 'G:\\' form, or None if
+    it isn't a single drive letter."""
+    if not value:
+        return None
+    c = value.strip().rstrip("\\").rstrip(":").upper()
+    if len(c) == 1 and "A" <= c <= "Z":
+        return c + ":\\"
+    return None
+
+
+def list_removable_drives(extra_watch_drives: Optional[list[str]] = None) -> list[str]:
     """Return drive letters (e.g. ['E:\\\\']) of USB storage to watch:
     anything Windows reports as DRIVE_REMOVABLE (flash drives, SD cards),
-    plus DRIVE_FIXED volumes on a USB bus (external hard drives/SSDs)."""
-    drives = []
+    plus DRIVE_FIXED volumes on a USB bus (external hard drives/SSDs).
+
+    `extra_watch_drives` is an explicit, opt-in list of drive letters to also
+    watch when present, for the narrow case a normal USB HDD/SSD can't cover:
+    a Thunderbolt/USB4 NVMe enclosure that reports its bus as NVMe rather than
+    USB. Those are deliberately NOT auto-detected — an internal system/data
+    NVMe disk reports the exact same bus type, and wrongly watching an
+    internal disk would log everything the user does locally. So this stays a
+    named, RR-IT-set choice per device, never a guess. The system drive is
+    still never watched, even if it's listed here by mistake."""
     system_drive = _system_drive_letter()
+    extra = set()
+    for v in (extra_watch_drives or []):
+        norm = _normalize_drive_letter(v)
+        if norm:
+            extra.add(norm)
+
+    drives = []
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
     for i in range(26):
         if not (bitmask & (1 << i)):
             continue
         letter = f"{chr(65 + i)}:\\"
         if letter == system_drive:
-            continue
+            continue  # never the OS drive, whatever the bus or the allowlist says
         try:
             drive_type = ctypes.windll.kernel32.GetDriveTypeW(letter)
             if drive_type == DRIVE_REMOVABLE:
                 drives.append(letter)
             elif drive_type == DRIVE_FIXED and _is_usb_bus_drive(letter):
+                drives.append(letter)
+            elif letter in extra and drive_type in (DRIVE_REMOVABLE, DRIVE_FIXED):
+                # Explicitly allow-listed (e.g. a USB4/Thunderbolt NVMe
+                # enclosure). Still require it to be a real disk volume, not a
+                # network/CD/RAM drive.
                 drives.append(letter)
         except Exception:
             continue
@@ -403,12 +483,47 @@ def acquire_single_instance_lock() -> bool:
         return True
 
 
-def scan_drive(drive_letter: str, log: logging.Logger) -> dict[str, tuple[float, int]]:
-    """Return {relative_path: (mtime, size)} for every file on the drive,
-    capped at MAX_FILES_PER_DRIVE_SCAN so a huge/slow drive can't hang a
-    poll cycle indefinitely."""
-    snapshot: dict[str, tuple[float, int]] = {}
+def get_free_bytes(drive_letter: str) -> Optional[int]:
+    """Free bytes available on the drive, via GetDiskFreeSpaceExW — or None
+    if it can't be read. This is a cheap filesystem-metadata call (normally
+    served from cache) that does NOT force a spun-down drive back awake the
+    way walking its whole tree does. For external hard drives/SSDs the poll
+    loop uses a change in this value as the signal to scan immediately,
+    between the less frequent scheduled full scans (see
+    FIXED_DRIVE_FULL_SCAN_SECONDS)."""
+    try:
+        free = ctypes.c_ulonglong(0)
+        ok = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+            ctypes.c_wchar_p(drive_letter),
+            ctypes.byref(free),   # lpFreeBytesAvailableToCaller
+            None,                 # lpTotalNumberOfBytes
+            None,                 # lpTotalNumberOfFreeBytes
+        )
+        if not ok:
+            return None
+        return free.value
+    except Exception:
+        return None
+
+
+def _creation_time(st: os.stat_result) -> float:
+    """File creation time. On Windows, Python 3.11 reports creation time as
+    st_ctime; Python 3.12+ adds st_birthtime for it (and st_ctime starts to
+    mean metadata-change time). Prefer st_birthtime where it exists."""
+    return getattr(st, "st_birthtime", st.st_ctime)
+
+
+def scan_drive(drive_letter: str, log: logging.Logger) -> tuple[dict[str, tuple[float, int, float]], bool]:
+    """Return ({relative_path: (mtime, size, creation_time)}, truncated).
+
+    `truncated` is True when the scan stopped early — at MAX_FILES_PER_DRIVE_SCAN
+    or SCAN_TIME_BUDGET_SECONDS — so the caller knows the snapshot is
+    incomplete and the per-file "is this new" comparison can't be trusted on
+    its own for this drive (see the mtime guard in the poll loop)."""
+    snapshot: dict[str, tuple[float, int, float]] = {}
     count = 0
+    truncated = False
+    deadline = time.monotonic() + SCAN_TIME_BUDGET_SECONDS
     try:
         for root, dirs, files in os.walk(drive_letter):
             # Don't even descend into Windows' own housekeeping folders —
@@ -418,24 +533,79 @@ def scan_drive(drive_letter: str, log: logging.Logger) -> dict[str, tuple[float,
             for name in files:
                 if name.lower() in IGNORED_FILE_NAMES:
                     continue
-                if count >= MAX_FILES_PER_DRIVE_SCAN:
+                if count >= MAX_FILES_PER_DRIVE_SCAN or time.monotonic() > deadline:
                     log.warning(
-                        "%s has more than %d files — stopped scanning early, "
-                        "some new files may not be reported this cycle",
-                        drive_letter, MAX_FILES_PER_DRIVE_SCAN,
+                        "%s is too large to enumerate fully (stopped after %d files / %ds) "
+                        "— on this drive a file is only reported if its creation or "
+                        "modified time is after monitoring started.",
+                        drive_letter, count, SCAN_TIME_BUDGET_SECONDS,
                     )
-                    return snapshot
+                    return snapshot, True
                 full_path = os.path.join(root, name)
                 try:
                     stat = os.stat(full_path)
                 except OSError:
                     continue
                 rel_path = os.path.relpath(full_path, drive_letter)
-                snapshot[rel_path] = (stat.st_mtime, stat.st_size)
+                snapshot[rel_path] = (stat.st_mtime, stat.st_size, _creation_time(stat))
                 count += 1
     except OSError as exc:
         log.warning("Could not scan %s: %s (drive may have been removed mid-scan)", drive_letter, exc)
-    return snapshot
+    return snapshot, truncated
+
+
+def _is_fixed_drive(drive_letter: str) -> bool:
+    """True for a DRIVE_FIXED volume (an external USB hard drive/SSD, or an
+    allow-listed one), which gets the hybrid scan schedule. False for a
+    flash drive/SD card, or if the type can't be read — both of which keep
+    the full scan every cycle, the safe default."""
+    try:
+        return ctypes.windll.kernel32.GetDriveTypeW(drive_letter) == DRIVE_FIXED
+    except Exception:
+        return False
+
+
+def should_scan_drive(info: dict, cur_free: Optional[int], now_mono: float) -> bool:
+    """Whether to walk this drive's files this cycle.
+
+    Flash drives/SD cards: always. External hard drives/SSDs: when free space
+    has changed at all since the last look (ordinary copying always changes
+    it, so this catches a copy within one cycle), when free space can't be
+    read either now or last time (can't tell, so scan — the old behaviour),
+    or when FIXED_DRIVE_FULL_SCAN_SECONDS have passed since the last full
+    scan (catches the rare writes that leave free space unchanged)."""
+    if not info.get("fixed"):
+        return True
+    prev_free = info.get("free_bytes")
+    if prev_free is None or cur_free is None:
+        return True
+    if cur_free != prev_free:
+        return True
+    return now_mono - info.get("last_full_scan", 0.0) >= FIXED_DRIVE_FULL_SCAN_SECONDS
+
+
+def find_written_files(info: dict, current_files: dict[str, tuple[float, int, float]]) -> list[str]:
+    """Relative paths in current_files that count as written since the
+    baseline: new, or changed size/modified time.
+
+    On a truncated-baseline drive (too big to enumerate fully), "not in the
+    baseline" can just mean the file was beyond the scan limit at connect, so
+    such a file is only reported when its creation time or modified time is
+    at/after monitoring started (minus TRUNCATED_BASELINE_TIME_MARGIN_SECONDS).
+    Creation time is what catches a copy — Windows gives a copied file a new
+    creation time but keeps the source's old modified time."""
+    baseline = info["files"]
+    check_times = not info.get("baseline_complete", True)
+    cutoff = info.get("watch_started_at", 0.0) - TRUNCATED_BASELINE_TIME_MARGIN_SECONDS
+    written = []
+    for rel_path, (mtime, size, created) in current_files.items():
+        entry = baseline.get(rel_path)
+        if entry is not None and entry[0] == mtime and entry[1] == size:
+            continue
+        if check_times and max(mtime, created) < cutoff:
+            continue
+        written.append(rel_path)
+    return written
 
 
 # --------------------------------------------------------------------------
@@ -626,7 +796,7 @@ def main() -> None:
     while True:
         try:
             now_ts = time.time()
-            current_drives = set(list_removable_drives())
+            current_drives = set(list_removable_drives(cfg.extra_watch_drives))
             known_drives = set(tracked.keys())
 
             # Newly connected drives.
@@ -646,8 +816,27 @@ def main() -> None:
                 label, serial = get_volume_info(drive)
                 device_name = label or drive.rstrip("\\")
                 log.info("USB device connected: %s (serial %s)", device_name, serial or "unknown")
-                baseline = scan_drive(drive, log)
-                tracked[drive] = {"name": device_name, "serial": serial, "files": baseline}
+                baseline, truncated = scan_drive(drive, log)
+                tracked[drive] = {
+                    "name": device_name,
+                    "serial": serial,
+                    "files": baseline,
+                    # A complete baseline means every pre-existing file is
+                    # known, so a later "not in baseline" file is genuinely
+                    # new. A truncated one can't promise that — see the mtime
+                    # guard in the re-scan step below.
+                    "baseline_complete": not truncated,
+                    # When monitoring of THIS connection began — the cutoff the
+                    # timestamp guard uses for a truncated-baseline drive.
+                    "watch_started_at": now_ts,
+                    # External HDD/SSD (or allow-listed) → hybrid schedule;
+                    # flash drive/SD card → full scan every cycle.
+                    "fixed": _is_fixed_drive(drive),
+                    # Last known free space, and when the last full scan ran
+                    # (the connect scan above counts as one).
+                    "free_bytes": get_free_bytes(drive),
+                    "last_full_scan": time.monotonic(),
+                }
                 state.enqueue([{
                     "eventType": "connected",
                     "timestamp": _now_iso(),
@@ -682,34 +871,52 @@ def main() -> None:
             # pending_disconnect above is included in this cycle too.)
             for drive in current_drives & set(tracked.keys()):
                 info = tracked[drive]
-                current_files = scan_drive(drive, log)
+
+                # Decide whether to walk this drive's files this cycle — see
+                # should_scan_drive() and FIXED_DRIVE_FULL_SCAN_SECONDS.
+                cur_free = get_free_bytes(drive)
+                now_mono = time.monotonic()
+                if not should_scan_drive(info, cur_free, now_mono):
+                    continue
+
+                current_files, truncated = scan_drive(drive, log)
+                info["last_full_scan"] = now_mono
+                # A drive that started with a complete baseline but is now too
+                # big to fully enumerate has become unreliable for exact
+                # per-file diffing — treat it as truncated from here on.
+                if truncated:
+                    info["baseline_complete"] = False
                 new_events = []
-                for rel_path, (mtime, size) in current_files.items():
-                    baseline_entry = info["files"].get(rel_path)
-                    if baseline_entry is None or baseline_entry[0] != mtime or baseline_entry[1] != size:
-                        new_events.append({
-                            "eventType": "file_written",
-                            "timestamp": _now_iso(),
-                            "usbDeviceName": info["name"],
-                            "usbSerialNumber": info["serial"],
-                            "driveLetter": drive,
-                            "filePath": rel_path,
-                            "fileSizeBytes": size,
-                        })
+                for rel_path in find_written_files(info, current_files):
+                    new_events.append({
+                        "eventType": "file_written",
+                        "timestamp": _now_iso(),
+                        "usbDeviceName": info["name"],
+                        "usbSerialNumber": info["serial"],
+                        "driveLetter": drive,
+                        "filePath": rel_path,
+                        "fileSizeBytes": current_files[rel_path][1],
+                    })
                 if new_events:
                     log.info("%d new/changed file(s) written to %s", len(new_events), info["name"])
                     state.enqueue(new_events)
-                # Merge rather than replace: on a drive over MAX_FILES_PER_DRIVE_SCAN,
-                # scan_drive() only returns a partial snapshot, and os.walk's traversal
-                # order can shift slightly between polls (files added/removed elsewhere
-                # on the drive). Overwriting the baseline with just this cycle's partial
-                # scan would forget any file that isn't rescanned this time, causing it
-                # to be reported as "new" all over again the next time it IS rescanned.
-                # Merging keeps every previously-known file's last-seen state unless
-                # this cycle's scan actually saw (and possibly updated) it.
+                # Merge rather than replace: on a drive too big to enumerate in
+                # one pass, scan_drive() only returns a partial snapshot, and
+                # os.walk's traversal order can shift slightly between polls
+                # (files added/removed elsewhere on the drive). Overwriting the
+                # baseline with just this cycle's partial scan would forget any
+                # file that isn't rescanned this time, causing it to be reported
+                # as "new" all over again the next time it IS rescanned. Merging
+                # keeps every previously-known file's last-seen state unless this
+                # cycle's scan actually saw (and possibly updated) it.
                 merged_baseline = dict(info["files"])
                 merged_baseline.update(current_files)
                 info["files"] = merged_baseline
+                # Record free space AFTER the scan, so the next cycle compares
+                # against the state this scan saw. Keep the old value if it
+                # couldn't be read this time.
+                if cur_free is not None:
+                    info["free_bytes"] = cur_free
 
         except Exception:
             log.exception("Unexpected error during USB scan — continuing")
