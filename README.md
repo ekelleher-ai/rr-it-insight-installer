@@ -163,6 +163,16 @@ watch file reads without a kernel driver, well beyond what this script (or
 ActivityWatch itself) does. Don't present "no USB events" as "nothing was
 copied off this machine" without that caveat.
 
+**Which drives it watches** (v2.0.0.12+): USB flash drives and SD cards
+(which Windows reports as "removable"), plus external USB hard drives and
+SSDs (which Windows reports as "fixed", like an internal disk — before
+v2.0.0.12 these were silently ignored). Internal disks and the Windows
+system drive are never watched. Two things to know: a USB hard drive left
+permanently plugged in (e.g. a desk backup drive) will report every file
+backup software writes to it; and on a drive with more than 20,000 files
+the scan stops early each cycle, so writes into the unscanned part of the
+drive can be missed (`usb_watcher.log` says when this happens).
+
 Where it shows up: the client dashboard's Individual drill-down shows a "USB
 removable-drive activity" table for that day, but only for a client with USB
 Monitoring enabled — it's simply not present in the UI for anyone else.
