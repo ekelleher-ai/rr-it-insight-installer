@@ -22,7 +22,9 @@ polling the removable drive's own filesystem for files that are new or have
 changed since we last looked — which is exactly the scenario that actually
 matters for a data-loss concern (someone copying company files FROM this
 PC ONTO a USB stick to take them elsewhere). This script does that:
-  - Detects a removable drive appearing/disappearing (by drive letter).
+  - Detects a removable drive appearing/disappearing (by drive letter) —
+    flash drives/SD cards, and (from v2.0.0.12) external USB hard drives
+    and SSDs, which Windows reports as "fixed" disks rather than removable.
   - On appearance, takes a baseline snapshot of what's already on it —
     pre-existing files are NOT reported (a drive that already has files on
     it isn't news; only NEW activity is).
@@ -96,9 +98,25 @@ MAX_FILES_PER_DRIVE_SCAN = 20000  # safety cap so a huge drive can't hang a poll
 # just after sitting gone for this long, not instantly.
 DEBOUNCE_SECONDS = 30
 
-# Windows drive type constant (from GetDriveTypeW) for removable media —
-# USB flash drives and SD cards via a reader both report this.
+# Windows drive type constants (from GetDriveTypeW). USB flash drives and SD
+# cards via a reader report DRIVE_REMOVABLE. Most external USB hard drives
+# and SSDs report DRIVE_FIXED instead — the same type as an internal disk —
+# so those are only watched when the storage bus underneath them is USB
+# (see _is_usb_bus_drive). Confirmed live on Edmond's PC (25 Sept): an
+# external USB hard drive was plugged in and written to with no event at
+# all, while a flash drive's connect/disconnect was reported correctly.
 DRIVE_REMOVABLE = 2
+DRIVE_FIXED = 3
+
+# IOCTL_STORAGE_QUERY_PROPERTY / STORAGE_DEVICE_DESCRIPTOR (winioctl.h),
+# used to ask a DRIVE_FIXED volume which bus it's attached through.
+IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+STORAGE_DEVICE_PROPERTY = 0       # PropertyId: StorageDeviceProperty
+PROPERTY_STANDARD_QUERY = 0       # QueryType: PropertyStandardQuery
+BUS_TYPE_OFFSET = 28              # byte offset of BusType in STORAGE_DEVICE_DESCRIPTOR
+BUS_TYPE_USB = 7                  # STORAGE_BUS_TYPE BusTypeUsb (UASP enclosures report this too)
+OPEN_EXISTING = 3
+FILE_SHARE_READ_WRITE = 0x1 | 0x2
 
 # Named mutex used to make sure only one copy of this watcher is ever
 # actually doing work at once. Confirmed live: the installer's Scheduled
@@ -249,16 +267,95 @@ class State:
 # Drive detection (Windows API via ctypes — no extra pip dependency)
 # --------------------------------------------------------------------------
 
+_IOCTL_KERNEL32 = None
+
+
+def _ioctl_kernel32():
+    """A private kernel32 handle with explicit 64-bit-safe signatures for the
+    three calls _is_usb_bus_drive needs. Kept separate from ctypes.windll so
+    setting argtypes/restype here can't change how any other call in this
+    file behaves, and built once rather than on every poll."""
+    global _IOCTL_KERNEL32
+    if _IOCTL_KERNEL32 is None:
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.DeviceIoControl.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+        ]
+        k.DeviceIoControl.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        _IOCTL_KERNEL32 = k
+    return _IOCTL_KERNEL32
+
+
+def _is_usb_bus_drive(drive_letter: str) -> bool:
+    """True if the volume at drive_letter (e.g. 'E:\\\\') sits on a USB bus.
+
+    Opens the volume with zero desired access — enough for
+    IOCTL_STORAGE_QUERY_PROPERTY and allowed for a standard (non-admin)
+    user, which matters because this watcher runs as the logged-on user.
+    Fails closed (False) on any error, so an internal disk can never be
+    mistaken for a USB one; the worst case is the pre-fix behaviour of an
+    external drive going unwatched."""
+    from ctypes import wintypes
+
+    kernel32 = _ioctl_kernel32()
+    volume_path = "\\\\.\\" + drive_letter.rstrip("\\")   # E:\ -> \\.\E:
+    handle = kernel32.CreateFileW(volume_path, 0, FILE_SHARE_READ_WRITE, None, OPEN_EXISTING, 0, None)
+    invalid = ctypes.c_void_p(-1).value
+    if not handle or handle == invalid:
+        return False
+    try:
+        # STORAGE_PROPERTY_QUERY: PropertyId, QueryType, AdditionalParameters[1] (padded to 12 bytes)
+        query = (ctypes.c_uint32 * 3)(STORAGE_DEVICE_PROPERTY, PROPERTY_STANDARD_QUERY, 0)
+        out_buf = ctypes.create_string_buffer(1024)
+        returned = wintypes.DWORD(0)
+        ok = kernel32.DeviceIoControl(
+            handle, IOCTL_STORAGE_QUERY_PROPERTY,
+            ctypes.byref(query), ctypes.sizeof(query),
+            out_buf, ctypes.sizeof(out_buf),
+            ctypes.byref(returned), None,
+        )
+        if not ok or returned.value < BUS_TYPE_OFFSET + 4:
+            return False
+        bus_type = int.from_bytes(out_buf.raw[BUS_TYPE_OFFSET:BUS_TYPE_OFFSET + 4], "little")
+        return bus_type == BUS_TYPE_USB
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _system_drive_letter() -> str:
+    """e.g. 'C:\\\\' — never treated as a USB drive, even if Windows itself
+    boots from USB (Windows To Go), since everything on it would look like a
+    file 'written to a USB device'."""
+    return (os.environ.get("SystemDrive") or "C:").rstrip("\\").upper() + "\\"
+
+
 def list_removable_drives() -> list[str]:
-    """Return drive letters (e.g. ['E:\\\\']) currently mounted as removable."""
+    """Return drive letters (e.g. ['E:\\\\']) of USB storage to watch:
+    anything Windows reports as DRIVE_REMOVABLE (flash drives, SD cards),
+    plus DRIVE_FIXED volumes on a USB bus (external hard drives/SSDs)."""
     drives = []
+    system_drive = _system_drive_letter()
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
     for i in range(26):
         if not (bitmask & (1 << i)):
             continue
         letter = f"{chr(65 + i)}:\\"
+        if letter == system_drive:
+            continue
         try:
-            if ctypes.windll.kernel32.GetDriveTypeW(letter) == DRIVE_REMOVABLE:
+            drive_type = ctypes.windll.kernel32.GetDriveTypeW(letter)
+            if drive_type == DRIVE_REMOVABLE:
+                drives.append(letter)
+            elif drive_type == DRIVE_FIXED and _is_usb_bus_drive(letter):
                 drives.append(letter)
         except Exception:
             continue
