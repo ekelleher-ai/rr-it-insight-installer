@@ -56,7 +56,7 @@
 ; cancels the service is left with nothing still running or logging.
 
 #define MyAppName "RR-IT Insight Agent"
-#define MyAppVersion "2.0.0.11"
+#define MyAppVersion "2.0.0.12"
 #define MyAppPublisher "Rapid Response IT"
 #define ExtensionId "nglaklhklhcoonedhgnpgddginnjdadi"
 #define ExtensionUpdateUrl "https://clients2.google.com/service/update2/crx"
