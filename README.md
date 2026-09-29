@@ -68,6 +68,32 @@ investigation continues separately from this reliability rework.
 This should be tested end-to-end on a real Windows machine (ideally the Test
 Clint pilot laptop again) before being relied on for other clients.
 
+## Upload schedule and Zite workflow runs (v2.0.0.14+)
+
+Every upload from a device is one Zite "workflow run", and the plan allows a
+fixed number per month across all devices (Business: 50,000). Before
+v2.0.0.14 the pusher uploaded roughly every 40 seconds, 24/7 while a PC was
+on — about 2,000 runs a day per PC.
+
+The pusher still reads ActivityWatch every 30 seconds and queues everything
+locally (nothing is recorded differently or lost), but it only **uploads**:
+- once per **upload interval** while there's real activity queued — set per
+  client in the RR-IT console ("Upload every", default 30 minutes, 5–240);
+- every **4 hours** at most while only idle time is queued (PC locked or
+  unattended, left on overnight);
+- straight away the very first time after install, so a new device appears
+  on the dashboard immediately.
+
+The server returns the client's interval on every upload and the pusher
+stores it locally, so changing it in the console reaches each device at its
+next upload — no reinstall. `upload_interval_minutes` in `config.json` is
+only the starting value. Consecutive queued rows for the same window are
+merged into one event before upload (totals unchanged).
+
+Rough cost per PC per month (office hours): ~530 runs at 30 minutes, ~330 at
+60. The dashboard is up to one interval behind; its "Last updated" time shows
+when each PC last uploaded. USB events still upload straight away.
+
 ## Diagnosing a client machine
 
 The pusher runs invisibly by design (built with `--noconsole` — a client should
@@ -180,6 +206,13 @@ leave free space unchanged (a same-size overwrite, a delete and a copy that
 cancel out, very small files). A permanently-connected backup drive is
 therefore walked every 2 minutes rather than every 15 seconds; it still
 wakes periodically, so it won't sleep for long stretches.
+
+**One report per file** (v2.0.0.14+): a newly-written file is reported once
+it's been seen unchanged on two consecutive scans, so a large copy still in
+progress is no longer reported twice (part-size, then full size). The report
+carries the time the file was first seen. Anything still settling when the
+drive is removed is reported at that point with its last-seen size, so a
+quick copy-then-unplug is still caught.
 
 **Very large drives**: a drive is enumerated up to 100,000 files / 20 seconds
 per scan. On a drive bigger than that the file list is incomplete, so — to
