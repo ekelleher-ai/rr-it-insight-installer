@@ -21,6 +21,11 @@ Design notes (see RR-IT Insight spec, sections 2 and 7):
     where it left off.
   - Retries use exponential backoff and never crash the loop: a bad
     response is logged and retried next cycle.
+  - Batched uploads (v2.0.0.14+): ActivityWatch is read and queued every
+    poll, but the queue is only uploaded once per client-configured interval
+    (default 30 min) while there's real activity, or every 4h while only idle
+    time is queued. Each upload is one Zite workflow run — see "Upload
+    schedule" below for why this matters.
 
 Deployment: silent install via RMM, run as a persistent process (Windows
 service via NSSM, or a Scheduled Task set to run at logon / on an interval
@@ -117,8 +122,116 @@ BROWSER_APP_NAMES = {
 }
 
 POLL_BATCH_LIMIT = 1000     # AW events fetched per bucket per poll
-SEND_BATCH_SIZE = 200       # events per HTTP POST to Zite
+SEND_BATCH_SIZE = 500       # events per HTTP POST to Zite (the endpoint's own cap)
 MAX_BACKOFF_SECONDS = 300
+
+# --------------------------------------------------------------------------
+# Upload schedule (v2.0.0.14+)
+#
+# Every upload is one Zite "workflow run", and the plan allows a fixed number
+# per month across ALL devices. Before v2.0.0.14 the pusher uploaded whatever
+# it found on every 30s poll, 24/7 while the PC was on — ~2,000 uploads a day
+# per PC, usually one event each (confirmed 28 Sept: 26,018 runs from one PC).
+#
+# Now: ActivityWatch is still read every poll_interval_seconds and everything
+# still goes into the local outbox straight away (nothing recorded
+# differently, nothing lost), but the outbox is only UPLOADED:
+#   - once per upload interval, when there's real (non-idle) activity queued;
+#   - otherwise, while only idle time is queued (PC locked/unattended,
+#     overnight), at most every IDLE_CATCHUP_SECONDS;
+#   - immediately on the very first upload after install, so a new device
+#     shows up on the dashboard straight away.
+# The interval is set per client in the RR-IT console; ingestEvents returns it
+# in every response and it's stored locally, so a change reaches each device
+# at its next upload. config.json's upload_interval_minutes is only the
+# starting value until the server has said otherwise.
+# --------------------------------------------------------------------------
+DEFAULT_UPLOAD_INTERVAL_MINUTES = 30
+MIN_UPLOAD_INTERVAL_MINUTES = 5
+MAX_UPLOAD_INTERVAL_MINUTES = 240
+IDLE_CATCHUP_SECONDS = 4 * 3600
+
+# Consecutive outbox rows for the same window that pick up exactly where the
+# previous one ended (the same focused window reported again on the next
+# poll, with its new seconds) are merged into one event before upload —
+# fewer, longer rows for the server to store and the dashboard to read.
+COALESCE_MAX_GAP_SECONDS = 2.0
+
+
+def clamp_upload_interval(value) -> int:
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_UPLOAD_INTERVAL_MINUTES
+    if n <= 0:
+        return DEFAULT_UPLOAD_INTERVAL_MINUTES
+    return max(MIN_UPLOAD_INTERVAL_MINUTES, min(MAX_UPLOAD_INTERVAL_MINUTES, n))
+
+
+def upload_due(
+    now_epoch: float,
+    last_upload_epoch: Optional[float],
+    interval_seconds: float,
+    queued_rows: int,
+    has_active: bool,
+) -> bool:
+    """Whether the outbox should be uploaded now. Pure, so it can be tested."""
+    if queued_rows <= 0:
+        return False
+    if last_upload_epoch is None:
+        return True  # never uploaded from this machine: show up straight away
+    elapsed = now_epoch - last_upload_epoch
+    if elapsed < 0:
+        return True  # clock moved backwards; upload once rather than stall
+    if has_active and elapsed >= interval_seconds:
+        return True
+    return elapsed >= IDLE_CATCHUP_SECONDS
+
+
+def coalesce_events(events: list[dict]) -> list[dict]:
+    """Merge contiguous events for the same window (same app/domain, title,
+    URL and idle state, next one starting within COALESCE_MAX_GAP_SECONDS of
+    the previous one's end) into one. Order-preserving; never merges events
+    that aren't contiguous, so the worst case is simply no merging."""
+    out: list[dict] = []
+    for e in events:
+        if out:
+            p = out[-1]
+            if (
+                p["appOrDomain"] == e["appOrDomain"]
+                and p.get("title") == e.get("title")
+                and p.get("url") == e.get("url")
+                and bool(p.get("idleFlag")) == bool(e.get("idleFlag"))
+            ):
+                p_start = _parse_ts(p["timestamp"]).timestamp()
+                e_start = _parse_ts(e["timestamp"]).timestamp()
+                p_end = p_start + float(p["durationSeconds"])
+                if abs(e_start - p_end) <= COALESCE_MAX_GAP_SECONDS:
+                    # Sum the recorded durations rather than stretching the
+                    # event across the small gap, so totals stay exactly what
+                    # ActivityWatch recorded.
+                    p["durationSeconds"] = float(p["durationSeconds"]) + float(e["durationSeconds"])
+                    continue
+        out.append(dict(e))
+    return out
+
+
+def find_upload_interval(payload, depth: int = 0) -> Optional[int]:
+    """Pull uploadIntervalMinutes out of an ingest response. It's a top-level
+    field today (checked against the live endpoint on 29 Sept), but search a
+    couple of levels down too so a response wrapper added later doesn't
+    silently stop interval changes reaching devices."""
+    if depth > 3:
+        return None
+    if isinstance(payload, dict):
+        v = payload.get("uploadIntervalMinutes")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return clamp_upload_interval(v)
+        for child in payload.values():
+            found = find_upload_interval(child, depth + 1)
+            if found is not None:
+                return found
+    return None
 
 
 @dataclass
@@ -130,6 +243,9 @@ class Config:
     poll_interval_seconds: int
     hostname: str
     user_name: Optional[str]
+    # Starting upload interval only — the server's per-client value (sent
+    # back on every upload) takes over from the first successful upload.
+    upload_interval_minutes: int
 
     @staticmethod
     def load(path: Path) -> "Config":
@@ -147,6 +263,9 @@ class Config:
             poll_interval_seconds=int(raw.get("poll_interval_seconds", 30)),
             hostname=raw.get("hostname") or socket.gethostname(),
             user_name=raw.get("user_name") or _default_user_name(),
+            upload_interval_minutes=clamp_upload_interval(
+                raw.get("upload_interval_minutes", DEFAULT_UPLOAD_INTERVAL_MINUTES)
+            ),
         )
 
 
@@ -240,6 +359,10 @@ class State:
                 last_timestamp_iso TEXT NOT NULL,
                 duration_sent REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -308,6 +431,39 @@ class State:
 
     def outbox_size(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+
+    def outbox_has_active(self) -> bool:
+        """True if anything queued is real (non-idle) activity."""
+        return self.conn.execute("SELECT 1 FROM outbox WHERE idle_flag = 0 LIMIT 1").fetchone() is not None
+
+    # Small key/value store for the upload schedule — persisted so a service
+    # restart (or NSSM restarting a crashed pusher) doesn't trigger an extra
+    # upload or forget the server's interval.
+    def get_setting(self, key: str) -> Optional[str]:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def get_last_upload_epoch(self) -> Optional[float]:
+        v = self.get_setting("last_upload_epoch")
+        try:
+            return float(v) if v is not None else None
+        except ValueError:
+            return None
+
+    def set_last_upload_epoch(self, epoch: float) -> None:
+        self.set_setting("last_upload_epoch", repr(epoch))
+
+    def get_upload_interval_minutes(self, fallback: int) -> int:
+        v = self.get_setting("upload_interval_minutes")
+        return clamp_upload_interval(v) if v is not None else fallback
 
     def get_progress(self, bucket_id: str) -> tuple[Optional[str], float]:
         row = self.conn.execute(
@@ -570,18 +726,21 @@ MAX_BAD_BATCH_RETRY_SECONDS = 24 * 3600
 _outbox_rejected_head_id = None      # id of the first row of the batch currently being rejected
 _outbox_rejected_since = 0.0         # time.monotonic() of that batch's first rejection
 
-def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> None:
+def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> bool:
+    """Send the outbox. Returns True only if it was fully drained (every
+    queued event accepted), which is what counts as "uploaded" for the
+    schedule in maybe_upload()."""
     global _outbox_backoff_seconds, _outbox_next_attempt_at, _outbox_rejected_head_id, _outbox_rejected_since
 
     now = time.monotonic()
     if now < _outbox_next_attempt_at:
-        return  # still inside the backoff window from a previous failure
+        return False  # still inside the backoff window from a previous failure
 
     while True:
         batch = state.peek_batch(SEND_BATCH_SIZE)
         if not batch:
             _outbox_backoff_seconds = 1  # caught up — reset for the next failure
-            return
+            return True
 
         # Zite's app endpoints expect the actual arguments wrapped under an
         # "inputs" key, not sent flat as the top-level POST body.
@@ -591,7 +750,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
                 "clientId": cfg.client_id,
                 "hostname": cfg.hostname,
                 "userName": cfg.user_name,
-                "events": [
+                "events": coalesce_events([
                     {
                         "appOrDomain": row["app_or_domain"],
                         "title": row["title"],
@@ -601,7 +760,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
                         "idleFlag": bool(row["idle_flag"]),
                     }
                     for row in batch
-                ],
+                ]),
             }
         }
 
@@ -614,12 +773,26 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
             )
             _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
             _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
-            return
+            return False
 
         if r.status_code == 200:
             state.delete_ids([row["id"] for row in batch])
             _outbox_rejected_head_id = None
-            log.info("Pushed %d events (outbox now %d)", len(batch), state.outbox_size())
+            log.info(
+                "Pushed %d queued rows as %d events (outbox now %d)",
+                len(batch), len(payload["inputs"]["events"]), state.outbox_size(),
+            )
+            # Adopt the client's current upload interval from the server.
+            try:
+                server_interval = find_upload_interval(r.json())
+            except ValueError:
+                server_interval = None
+            if server_interval is not None:
+                current = state.get_upload_interval_minutes(cfg.upload_interval_minutes)
+                if server_interval != current or state.get_setting("upload_interval_minutes") is None:
+                    state.set_setting("upload_interval_minutes", str(server_interval))
+                    if server_interval != current:
+                        log.info("Upload interval is now %d minutes (set by RR-IT)", server_interval)
             continue
 
         if r.status_code in (401, 403):
@@ -628,7 +801,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
                 r.status_code, r.text[:300],
             )
             _outbox_next_attempt_at = time.monotonic() + MAX_BACKOFF_SECONDS
-            return
+            return False
 
         if r.status_code in (400, 413, 422):
             # 404 is deliberately NOT in this list: it means the ingest URL
@@ -652,7 +825,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
                 )
                 _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
                 _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
-                return
+                return False
             log.error(
                 "Ingest has rejected the same batch of %d events (%s) continuously for "
                 "%dh: %s — dropping it so later events aren't blocked forever. "
@@ -670,7 +843,28 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
         )
         _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
         _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
-        return
+        return False
+
+
+def maybe_upload(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> bool:
+    """Upload the outbox if the schedule says it's time (see upload_due and
+    the "Upload schedule" notes at the top). Returns True if an upload fully
+    drained the outbox. Recording is unaffected — poll_once() keeps queueing
+    every poll; this only decides when to deliver."""
+    interval_minutes = state.get_upload_interval_minutes(cfg.upload_interval_minutes)
+    queued = state.outbox_size()
+    if not upload_due(
+        now_epoch=time.time(),
+        last_upload_epoch=state.get_last_upload_epoch(),
+        interval_seconds=interval_minutes * 60,
+        queued_rows=queued,
+        has_active=state.outbox_has_active(),
+    ):
+        return False
+    drained = flush_outbox(state, cfg, session, log)
+    if drained:
+        state.set_last_upload_epoch(time.time())
+    return drained
 
 
 def poll_once(aw: AWClient, state: State, cfg: Config, log: logging.Logger) -> None:
@@ -751,8 +945,10 @@ def main() -> None:
         return
 
     log.info(
-        "RR-IT Insight pusher starting — host=%s client=%s aw=%s -> %s",
+        "RR-IT Insight pusher starting — host=%s client=%s aw=%s -> %s (upload every %d min when active, "
+        "idle catch-up every %dh)",
         cfg.hostname, cfg.client_id, cfg.aw_api_url, cfg.zite_ingest_url,
+        state.get_upload_interval_minutes(cfg.upload_interval_minutes), IDLE_CATCHUP_SECONDS // 3600,
     )
 
     while True:
@@ -764,9 +960,9 @@ def main() -> None:
             log.exception("Unexpected error during poll — continuing")
 
         try:
-            flush_outbox(state, cfg, session, log)
+            maybe_upload(state, cfg, session, log)
         except Exception:
-            log.exception("Unexpected error during flush — continuing")
+            log.exception("Unexpected error during upload — continuing")
 
         time.sleep(cfg.poll_interval_seconds)
 

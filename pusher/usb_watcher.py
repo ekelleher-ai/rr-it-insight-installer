@@ -510,7 +510,10 @@ def _creation_time(st: os.stat_result) -> float:
     """File creation time. On Windows, Python 3.11 reports creation time as
     st_ctime; Python 3.12+ adds st_birthtime for it (and st_ctime starts to
     mean metadata-change time). Prefer st_birthtime where it exists."""
-    return getattr(st, "st_birthtime", st.st_ctime)
+    # Not getattr(st, "st_birthtime", st.st_ctime): that evaluates st_ctime
+    # every time, which raises a DeprecationWarning on Python 3.12+ Windows.
+    birth = getattr(st, "st_birthtime", None)
+    return birth if birth is not None else st.st_ctime
 
 
 def scan_drive(drive_letter: str, log: logging.Logger) -> tuple[dict[str, tuple[float, int, float]], bool]:
@@ -519,7 +522,8 @@ def scan_drive(drive_letter: str, log: logging.Logger) -> tuple[dict[str, tuple[
     `truncated` is True when the scan stopped early — at MAX_FILES_PER_DRIVE_SCAN
     or SCAN_TIME_BUDGET_SECONDS — so the caller knows the snapshot is
     incomplete and the per-file "is this new" comparison can't be trusted on
-    its own for this drive (see the mtime guard in the poll loop)."""
+    its own for this drive (see the creation/modified-time check in
+    find_written_files)."""
     snapshot: dict[str, tuple[float, int, float]] = {}
     count = 0
     truncated = False
@@ -576,6 +580,8 @@ def should_scan_drive(info: dict, cur_free: Optional[int], now_mono: float) -> b
     scan (catches the rare writes that leave free space unchanged)."""
     if not info.get("fixed"):
         return True
+    if info.get("pending"):
+        return True  # a file is waiting to settle — check it next cycle
     prev_free = info.get("free_bytes")
     if prev_free is None or cur_free is None:
         return True
@@ -606,6 +612,57 @@ def find_written_files(info: dict, current_files: dict[str, tuple[float, int, fl
             continue
         written.append(rel_path)
     return written
+
+
+def settle_written_files(
+    info: dict,
+    current_files: dict[str, tuple[float, int, float]],
+    candidates: list[str],
+    truncated: bool,
+    now_iso: str,
+) -> tuple[list[tuple[str, int, str]], dict[str, tuple[float, int, str]]]:
+    """Only report a written file once it has stopped changing.
+
+    A large copy is often still in progress when a scan runs; reporting it
+    straight away gave one event at a partial size and a second at the final
+    size. Now a newly-written file is first held in info["pending"] with the
+    (mtime, size) seen and when it was first seen, and reported on a later
+    scan that finds it unchanged. Returns (confirmed, still_pending):
+    confirmed is [(rel_path, size, first_seen_iso)] to report now.
+
+    A pending file that has since disappeared from the drive (copied and
+    then deleted before it settled) is still reported — it was written.
+    Pending files are also flushed when the drive disconnects (see
+    flush_pending_on_disconnect), so a quick copy-then-unplug is never lost.
+    """
+    pending: dict[str, tuple[float, int, str]] = info.get("pending") or {}
+    confirmed: list[tuple[str, int, str]] = []
+    still_pending: dict[str, tuple[float, int, str]] = {}
+    candidate_set = set(candidates)
+    for rel in candidates:
+        mtime, size, _created = current_files[rel]
+        prev = pending.get(rel)
+        if prev is not None and prev[0] == mtime and prev[1] == size:
+            confirmed.append((rel, size, prev[2]))
+        else:
+            still_pending[rel] = (mtime, size, prev[2] if prev is not None else now_iso)
+    for rel, prev in pending.items():
+        if rel in candidate_set:
+            continue
+        if rel in current_files:
+            continue  # now matches the baseline again — nothing to report
+        if truncated:
+            still_pending[rel] = prev  # scan didn't reach it; keep waiting
+        else:
+            confirmed.append((rel, prev[1], prev[2]))  # written, then removed
+    return confirmed, still_pending
+
+
+def flush_pending_on_disconnect(info: dict) -> list[tuple[str, int, str]]:
+    """Files still waiting to settle when their drive is removed are reported
+    with the last size seen — the drive left with them on it."""
+    pending: dict[str, tuple[float, int, str]] = info.get("pending") or {}
+    return [(rel, v[1], v[2]) for rel, v in pending.items()]
 
 
 # --------------------------------------------------------------------------
@@ -836,6 +893,10 @@ def main() -> None:
                     # (the connect scan above counts as one).
                     "free_bytes": get_free_bytes(drive),
                     "last_full_scan": time.monotonic(),
+                    # Newly-written files waiting to be seen unchanged on a
+                    # second scan before being reported — see
+                    # settle_written_files().
+                    "pending": {},
                 }
                 state.enqueue([{
                     "eventType": "connected",
@@ -856,6 +917,21 @@ def main() -> None:
                 entry = pending_disconnect[drive]
                 if now_ts - entry["disconnected_at"] >= DEBOUNCE_SECONDS:
                     info = pending_disconnect.pop(drive)["info"]
+                    unsettled = flush_pending_on_disconnect(info)
+                    if unsettled:
+                        log.info(
+                            "%d file(s) written to %s just before it was removed",
+                            len(unsettled), info["name"],
+                        )
+                        state.enqueue([{
+                            "eventType": "file_written",
+                            "timestamp": first_seen,
+                            "usbDeviceName": info["name"],
+                            "usbSerialNumber": info["serial"],
+                            "driveLetter": drive,
+                            "filePath": rel_path,
+                            "fileSizeBytes": size,
+                        } for rel_path, size, first_seen in unsettled])
                     log.info("USB device disconnected: %s", info["name"])
                     state.enqueue([{
                         "eventType": "disconnected",
@@ -886,17 +962,19 @@ def main() -> None:
                 # per-file diffing — treat it as truncated from here on.
                 if truncated:
                     info["baseline_complete"] = False
-                new_events = []
-                for rel_path in find_written_files(info, current_files):
-                    new_events.append({
-                        "eventType": "file_written",
-                        "timestamp": _now_iso(),
-                        "usbDeviceName": info["name"],
-                        "usbSerialNumber": info["serial"],
-                        "driveLetter": drive,
-                        "filePath": rel_path,
-                        "fileSizeBytes": current_files[rel_path][1],
-                    })
+                candidates = find_written_files(info, current_files)
+                confirmed, still_pending = settle_written_files(
+                    info, current_files, candidates, truncated, _now_iso()
+                )
+                new_events = [{
+                    "eventType": "file_written",
+                    "timestamp": first_seen,
+                    "usbDeviceName": info["name"],
+                    "usbSerialNumber": info["serial"],
+                    "driveLetter": drive,
+                    "filePath": rel_path,
+                    "fileSizeBytes": size,
+                } for rel_path, size, first_seen in confirmed]
                 if new_events:
                     log.info("%d new/changed file(s) written to %s", len(new_events), info["name"])
                     state.enqueue(new_events)
@@ -909,9 +987,20 @@ def main() -> None:
                 # as "new" all over again the next time it IS rescanned. Merging
                 # keeps every previously-known file's last-seen state unless this
                 # cycle's scan actually saw (and possibly updated) it.
-                merged_baseline = dict(info["files"])
+                #
+                # Files still waiting to settle are NOT merged in: they must
+                # keep differing from the baseline so the next scan sees them
+                # again and can confirm them.
+                old_baseline = info["files"]
+                merged_baseline = dict(old_baseline)
                 merged_baseline.update(current_files)
+                for rel in still_pending:
+                    if rel in old_baseline:
+                        merged_baseline[rel] = old_baseline[rel]
+                    else:
+                        merged_baseline.pop(rel, None)
                 info["files"] = merged_baseline
+                info["pending"] = still_pending
                 # Record free space AFTER the scan, so the next cycle compares
                 # against the state this scan saw. Keep the old value if it
                 # couldn't be read this time.
