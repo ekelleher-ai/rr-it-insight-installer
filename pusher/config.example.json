@@ -5,6 +5,7 @@
   "client_id": "PASTE-CLIENT-ID-HERE",
   "poll_interval_seconds": 30,
   "upload_interval_minutes": 30,
+  "receiver_url": "https://rrit-receiver.ekelleher.workers.dev",
   "usb_monitoring_enabled": false,
   "extra_watch_drives": []
 }

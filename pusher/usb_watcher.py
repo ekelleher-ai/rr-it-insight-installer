@@ -179,6 +179,14 @@ ERROR_ALREADY_EXISTS = 183
 IGNORED_DIR_NAMES = {"system volume information", "$recycle.bin"}
 IGNORED_FILE_NAMES = {"desktop.ini", "thumbs.db", "autorun.inf"}
 
+# Receiver (v2.0.0.15+) — same as aw_pusher.py: USB batches go to the RR-IT
+# receiver first and Zite collects them every 5 minutes (one Zite run for all
+# PCs), so USB events can show up to ~5 minutes later than before. If the
+# receiver can't be reached or answers 404/5xx the batch goes straight to Zite.
+# config.json "receiver_url": "" turns the receiver off for this PC.
+DEFAULT_RECEIVER_URL = "https://rrit-receiver.ekelleher.workers.dev"
+RECEIVER_TRIES = 2
+
 
 @dataclass
 class Config:
@@ -192,6 +200,7 @@ class Config:
     # can't safely catch (a USB4/Thunderbolt NVMe enclosure reporting an NVMe
     # bus). Empty for almost every device. See list_removable_drives().
     extra_watch_drives: list[str]
+    receiver_url: str = DEFAULT_RECEIVER_URL
 
     @staticmethod
     def load(path: Path) -> "Config":
@@ -215,6 +224,7 @@ class Config:
                 if isinstance(raw.get("extra_watch_drives"), list)
                 else []
             ),
+            receiver_url=str(raw.get("receiver_url", DEFAULT_RECEIVER_URL) or "").rstrip("/"),
         )
 
 
@@ -681,6 +691,47 @@ MAX_BAD_BATCH_RETRY_SECONDS = 24 * 3600
 _usb_outbox_rejected_head_id = None
 _usb_outbox_rejected_since = 0.0
 
+class _Reply:
+    def __init__(self, status: Optional[int], text: str = "", data=None, via: str = "", error: str = ""):
+        self.status = status
+        self.text = text
+        self.data = data
+        self.via = via
+        self.error = error
+
+
+def _post_json(session: requests.Session, url: str, payload: dict, via: str) -> _Reply:
+    try:
+        r = session.post(url, json=payload, timeout=30)
+    except requests.RequestException as exc:
+        return _Reply(None, via=via, error=str(exc))
+    try:
+        data = r.json()
+    except ValueError:
+        data = None
+    return _Reply(r.status_code, r.text, data, via)
+
+
+def deliver(session: requests.Session, cfg: Config, payload: dict, log: logging.Logger) -> _Reply:
+    """Receiver first, Zite as the fallback (mirrors aw_pusher.deliver)."""
+    if cfg.receiver_url:
+        reply = _Reply(None)
+        for _ in range(RECEIVER_TRIES):
+            reply = _post_json(session, cfg.receiver_url + "/ins/usb", payload, "receiver")
+            if reply.status is not None and reply.status < 500 and reply.status != 404:
+                break
+        if reply.status is not None and reply.status < 500 and reply.status != 404:
+            if reply.status == 200 and isinstance(reply.data, dict) and reply.data.get("deliverDirect"):
+                direct = _post_json(session, cfg.zite_usb_ingest_url, payload, "zite")
+                if direct.status != 200:
+                    log.warning("Direct USB delivery also asked for, Zite answered %s %s",
+                                direct.status, (direct.text or direct.error)[:200])
+            return reply
+        log.warning("Receiver unavailable (%s) — sending USB events straight to Zite instead.",
+                    reply.status if reply.status is not None else reply.error[:200])
+    return _post_json(session, cfg.zite_usb_ingest_url, payload, "zite")
+
+
 def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> None:
     global _usb_outbox_backoff_seconds, _usb_outbox_next_attempt_at, _usb_outbox_rejected_head_id, _usb_outbox_rejected_since
 
@@ -715,28 +766,33 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
             }
         }
 
-        try:
-            r = session.post(cfg.zite_usb_ingest_url, json=payload, timeout=30)
-        except requests.RequestException as exc:
+        r = deliver(session, cfg, payload, log)
+        if r.status is None:
             log.warning(
                 "USB ingest POST failed (network): %s — will retry in %ss",
-                exc, _usb_outbox_backoff_seconds,
+                r.error[:300], _usb_outbox_backoff_seconds,
             )
             _usb_outbox_next_attempt_at = time.monotonic() + _usb_outbox_backoff_seconds
             _usb_outbox_backoff_seconds = min(_usb_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
             return
 
-        if r.status_code == 200:
+        if r.status == 200:
             state.delete_ids([row["id"] for row in batch])
             _usb_outbox_rejected_head_id = None
-            log.info("Pushed %d USB events (outbox now %d)", len(batch), state.outbox_size())
+            log.info("Pushed %d USB events via %s (outbox now %d)", len(batch), r.via, state.outbox_size())
             continue
 
-        if r.status_code in (401, 403):
+        if r.status == 429:
+            log.warning("Receiver asked us to slow down (429) — retrying in %ss", _usb_outbox_backoff_seconds)
+            _usb_outbox_next_attempt_at = time.monotonic() + _usb_outbox_backoff_seconds
+            _usb_outbox_backoff_seconds = min(_usb_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
+            return
+
+        if r.status in (401, 403):
             log.error(
                 "USB ingest rejected the request (%s): %s — check api_key/client_id, "
                 "and that USB Monitoring is enabled for this client.",
-                r.status_code, r.text[:300],
+                r.status, r.text[:300],
             )
             # Don't retain rejected USB activity indefinitely: if this
             # client's USB monitoring is simply off (or the key was
@@ -758,7 +814,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
             _usb_outbox_next_attempt_at = time.monotonic() + MAX_BACKOFF_SECONDS
             return
 
-        if r.status_code in (400, 413, 422):
+        if r.status in (400, 413, 422):
             # 404 deliberately excluded — see aw_pusher.py's flush_outbox.
             head_id = batch[0]["id"]
             if head_id != _usb_outbox_rejected_head_id:
@@ -770,7 +826,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
                     "USB ingest rejected a batch of %d events (%s): %s — retrying in %ss "
                     "(rejected for %dm so far; dropped only after %dh of continuous "
                     "rejection, in case this is a temporary server-side fault).",
-                    len(batch), r.status_code, r.text[:300], _usb_outbox_backoff_seconds,
+                    len(batch), r.status, r.text[:300], _usb_outbox_backoff_seconds,
                     rejected_for // 60, MAX_BAD_BATCH_RETRY_SECONDS // 3600,
                 )
                 _usb_outbox_next_attempt_at = time.monotonic() + _usb_outbox_backoff_seconds
@@ -779,7 +835,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
             log.error(
                 "USB ingest has rejected the same batch of %d events (%s) continuously "
                 "for %dh: %s — dropping it so later events aren't blocked forever.",
-                len(batch), r.status_code, MAX_BAD_BATCH_RETRY_SECONDS // 3600, r.text[:300],
+                len(batch), r.status, MAX_BAD_BATCH_RETRY_SECONDS // 3600, r.text[:300],
             )
             state.delete_ids([row["id"] for row in batch])
             _usb_outbox_rejected_head_id = None
@@ -787,7 +843,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
 
         log.warning(
             "USB ingest returned %s: %s — will retry in %ss",
-            r.status_code, r.text[:300], _usb_outbox_backoff_seconds,
+            r.status, r.text[:300], _usb_outbox_backoff_seconds,
         )
         _usb_outbox_next_attempt_at = time.monotonic() + _usb_outbox_backoff_seconds
         _usb_outbox_backoff_seconds = min(_usb_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)

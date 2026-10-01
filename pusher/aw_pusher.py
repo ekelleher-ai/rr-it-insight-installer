@@ -23,9 +23,22 @@ Design notes (see RR-IT Insight spec, sections 2 and 7):
     response is logged and retried next cycle.
   - Batched uploads (v2.0.0.14+): ActivityWatch is read and queued every
     poll, but the queue is only uploaded once per client-configured interval
-    (default 30 min) while there's real activity, or every 4h while only idle
-    time is queued. Each upload is one Zite workflow run — see "Upload
-    schedule" below for why this matters.
+    while there's real activity, or every 4h while only idle time is queued.
+    See "Upload schedule" below.
+  - Receiver first (v2.0.0.15+): uploads go to the RR-IT receiver (a small
+    Cloudflare Worker), which Zite collects from in one run every 5 minutes,
+    so Zite's workflow-run usage no longer grows with the number of PCs.
+    If the receiver can't be reached (or answers with a server error) the
+    same upload goes straight to Zite, exactly as before — nothing depends
+    on the receiver being up. See "Receiver" below.
+  - Live view (v2.0.0.15+, opt-in per client): while enabled for this
+    client, a tiny "current app + active/idle" status is sent to the
+    receiver about once a minute. App/website name only — never window
+    titles, URLs or screen content.
+  - Auto-update (v2.0.0.15+): the server says which agent version RR-IT has
+    approved for this client; this script only writes that version number
+    to update-target.json. The Watchdog task (SYSTEM) does the download,
+    checks the release's signature and hash, and installs it.
 
 Deployment: silent install via RMM, run as a persistent process (Windows
 service via NSSM, or a Scheduled Task set to run at logon / on an interval
@@ -113,6 +126,14 @@ def _app_dir() -> Path:
 _DATA_DIR = Path(os.environ.get("PROGRAMDATA", str(_app_dir()))) / "RR-IT Insight"
 
 DEFAULT_CONFIG_PATH = _app_dir() / "config.json"
+# Written by the installer (v2.0.0.15+); the version this PC is running.
+VERSION_FILE = _app_dir() / "version.txt"
+# Auto-update hand-off with watchdog.ps1. Both live in the install folder
+# (Program Files), which standard users can't write to — only this service
+# (LocalSystem) and the SYSTEM watchdog can.
+UPDATE_TARGET_FILE = _app_dir() / "update-target.json"
+UPDATE_STATUS_FILE = _app_dir() / "update-status.json"
+AGENT_VERSION_FALLBACK = "2.0.0.15"
 DEFAULT_STATE_DIR = _DATA_DIR / "state"
 DEFAULT_LOG_PATH = _DATA_DIR / "pusher.log"
 
@@ -156,6 +177,89 @@ IDLE_CATCHUP_SECONDS = 4 * 3600
 # poll, with its new seconds) are merged into one event before upload —
 # fewer, longer rows for the server to store and the dashboard to read.
 COALESCE_MAX_GAP_SECONDS = 2.0
+
+# --------------------------------------------------------------------------
+# Receiver (v2.0.0.15+)
+#
+# Uploads go to the RR-IT receiver first and Zite collects them from there in
+# one run every 5 minutes, whatever the number of PCs (each direct upload to
+# Zite is one workflow run). The receiver answers in the same shape as Zite's
+# ingestEvents, plus:
+#   deliverDirect  — Zite hasn't collected for 20+ min (or ever): ALSO post
+#                    this upload straight to Zite so the dashboard doesn't go
+#                    stale. Zite ignores the duplicate when it later collects.
+#   live           — {"enabled": bool, "intervalSeconds": n} for Live view.
+#   update         — {"version": "x.y.z.w"} approved by RR-IT, or null.
+# Fallback: if the receiver can't be reached, or answers 404/5xx, the upload
+# goes straight to Zite (old behaviour). 401/403/400/413/422 are real answers
+# and handled like Zite's; 429 means "slow down" and is just retried later.
+# config.json "receiver_url": "" turns the receiver off for this PC.
+# --------------------------------------------------------------------------
+DEFAULT_RECEIVER_URL = "https://rrit-receiver.ekelleher.workers.dev"
+RECEIVER_TRIES = 2
+LIVE_DEFAULT_INTERVAL_SECONDS = 60
+LIVE_MIN_INTERVAL_SECONDS = 30
+LIVE_MAX_INTERVAL_SECONDS = 600
+
+
+def read_agent_version() -> str:
+    try:
+        v = VERSION_FILE.read_text(encoding="utf-8").strip()
+        if v and all(part.isdigit() for part in v.split(".")):
+            return v
+    except OSError:
+        pass
+    return AGENT_VERSION_FALLBACK
+
+
+def read_update_status() -> Optional[str]:
+    """One-line summary of watchdog.ps1's last update attempt, reported with
+    uploads so the console can show it. None if no attempt was ever made."""
+    try:
+        data = json.loads(UPDATE_STATUS_FILE.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    parts = [str(data.get("state") or "unknown")]
+    if data.get("target"):
+        parts.append(str(data["target"]))
+    if data.get("at"):
+        parts.append("at " + str(data["at"]))
+    if data.get("error"):
+        parts.append("- " + str(data["error"])[:200])
+    return " ".join(parts)[:300]
+
+
+def write_update_target(version: Optional[str], log: logging.Logger) -> None:
+    """Tell watchdog.ps1 which version RR-IT has approved (None = no update)."""
+    try:
+        if version:
+            UPDATE_TARGET_FILE.write_text(
+                json.dumps({"version": version, "setAt": _now_iso()}), encoding="utf-8"
+            )
+        elif UPDATE_TARGET_FILE.exists():
+            UPDATE_TARGET_FILE.unlink()
+    except OSError as exc:
+        log.warning("Could not write %s: %s", UPDATE_TARGET_FILE, exc)
+
+
+def valid_version(v) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    parts = v.split(".")
+    if 2 <= len(parts) <= 4 and all(p.isdigit() and len(p) <= 6 for p in parts):
+        return v
+    return None
+
+
+def clamp_live_interval(value) -> int:
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        return LIVE_DEFAULT_INTERVAL_SECONDS
+    return max(LIVE_MIN_INTERVAL_SECONDS, min(LIVE_MAX_INTERVAL_SECONDS, n))
 
 
 def clamp_upload_interval(value) -> int:
@@ -246,6 +350,8 @@ class Config:
     # Starting upload interval only — the server's per-client value (sent
     # back on every upload) takes over from the first successful upload.
     upload_interval_minutes: int
+    # "" = receiver off (upload straight to Zite, pre-2.0.0.15 behaviour).
+    receiver_url: str = DEFAULT_RECEIVER_URL
 
     @staticmethod
     def load(path: Path) -> "Config":
@@ -266,6 +372,7 @@ class Config:
             upload_interval_minutes=clamp_upload_interval(
                 raw.get("upload_interval_minutes", DEFAULT_UPLOAD_INTERVAL_MINUTES)
             ),
+            receiver_url=str(raw.get("receiver_url", DEFAULT_RECEIVER_URL) or "").rstrip("/"),
         )
 
 
@@ -726,6 +833,100 @@ MAX_BAD_BATCH_RETRY_SECONDS = 24 * 3600
 _outbox_rejected_head_id = None      # id of the first row of the batch currently being rejected
 _outbox_rejected_since = 0.0         # time.monotonic() of that batch's first rejection
 
+class _Reply:
+    """What came back from an upload attempt: an HTTP status (None = network
+    failure everywhere) plus which endpoint answered."""
+    def __init__(self, status: Optional[int], text: str = "", data=None, via: str = "", error: str = ""):
+        self.status = status
+        self.text = text
+        self.data = data
+        self.via = via
+        self.error = error
+
+
+def _post_json(session: requests.Session, url: str, payload: dict, via: str) -> _Reply:
+    try:
+        r = session.post(url, json=payload, timeout=30)
+    except requests.RequestException as exc:
+        return _Reply(None, via=via, error=str(exc))
+    try:
+        data = r.json()
+    except ValueError:
+        data = None
+    return _Reply(r.status_code, r.text, data, via)
+
+
+def deliver(
+    session: requests.Session,
+    receiver_url: str,
+    receiver_path: str,
+    zite_url: str,
+    payload: dict,
+    log: logging.Logger,
+) -> _Reply:
+    """Send one upload: receiver first (if configured), Zite as the fallback.
+    Shared by the pusher and usb_watcher.py's copy of this logic."""
+    if receiver_url:
+        reply = _Reply(None)
+        for attempt in range(RECEIVER_TRIES):
+            reply = _post_json(session, receiver_url + receiver_path, payload, "receiver")
+            if reply.status is not None and reply.status < 500 and reply.status != 404:
+                break
+        if reply.status is not None and reply.status < 500 and reply.status != 404:
+            if reply.status == 200 and isinstance(reply.data, dict) and reply.data.get("deliverDirect"):
+                # Zite hasn't collected from the receiver for a while: also
+                # deliver directly so the dashboard stays current. Zite
+                # ignores the copy it later collects (its duplicate guard).
+                direct = _post_json(session, zite_url, payload, "zite")
+                if direct.status != 200:
+                    log.warning(
+                        "Receiver asked for direct delivery too, but Zite answered %s %s — "
+                        "the receiver copy will still reach Zite when collection resumes.",
+                        direct.status, (direct.text or direct.error)[:200],
+                    )
+            return reply
+        log.warning(
+            "Receiver unavailable (%s) — sending this upload straight to Zite instead.",
+            reply.status if reply.status is not None else reply.error[:200],
+        )
+    return _post_json(session, zite_url, payload, "zite")
+
+
+def apply_server_reply(state: "State", cfg: Config, data, log: logging.Logger) -> None:
+    """Adopt the settings the server sends back with every successful upload:
+    upload interval, Live view on/off, and the approved agent version."""
+    if not isinstance(data, dict):
+        return
+    server_interval = find_upload_interval(data)
+    if server_interval is not None:
+        current = state.get_upload_interval_minutes(cfg.upload_interval_minutes)
+        if server_interval != current or state.get_setting("upload_interval_minutes") is None:
+            state.set_setting("upload_interval_minutes", str(server_interval))
+            if server_interval != current:
+                log.info("Upload interval is now %d minutes (set by RR-IT)", server_interval)
+
+    if "live" in data:
+        live = data.get("live") if isinstance(data.get("live"), dict) else {}
+        enabled = "1" if live.get("enabled") else "0"
+        interval = str(clamp_live_interval(live.get("intervalSeconds", LIVE_DEFAULT_INTERVAL_SECONDS)))
+        if state.get_setting("live_enabled") != enabled:
+            log.info("Live view is now %s for this client", "ON" if enabled == "1" else "off")
+        state.set_setting("live_enabled", enabled)
+        state.set_setting("live_interval_seconds", interval)
+
+    if "update" in data:
+        upd = data.get("update") if isinstance(data.get("update"), dict) else None
+        target = valid_version(upd.get("version")) if upd else None
+        previous = state.get_setting("update_target") or ""
+        if (target or "") != previous:
+            state.set_setting("update_target", target or "")
+            write_update_target(target, log)
+            if target:
+                log.info("RR-IT approved agent version %s for this client (running %s)", target, read_agent_version())
+        elif target and not UPDATE_TARGET_FILE.exists():
+            write_update_target(target, log)
+
+
 def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> bool:
     """Send the outbox. Returns True only if it was fully drained (every
     queued event accepted), which is what counts as "uploaded" for the
@@ -750,6 +951,8 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
                 "clientId": cfg.client_id,
                 "hostname": cfg.hostname,
                 "userName": cfg.user_name,
+                "agentVersion": read_agent_version(),
+                "updateStatus": read_update_status(),
                 "events": coalesce_events([
                     {
                         "appOrDomain": row["app_or_domain"],
@@ -764,46 +967,41 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
             }
         }
 
-        try:
-            r = session.post(cfg.zite_ingest_url, json=payload, timeout=30)
-        except requests.RequestException as exc:
+        r = deliver(session, cfg.receiver_url, "/ins/events", cfg.zite_ingest_url, payload, log)
+        if r.status is None:
             log.warning(
                 "Ingest POST failed (network): %s — will retry in %ss",
-                exc, _outbox_backoff_seconds,
+                r.error[:300], _outbox_backoff_seconds,
             )
             _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
             _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
             return False
 
-        if r.status_code == 200:
+        if r.status == 200:
             state.delete_ids([row["id"] for row in batch])
             _outbox_rejected_head_id = None
             log.info(
-                "Pushed %d queued rows as %d events (outbox now %d)",
-                len(batch), len(payload["inputs"]["events"]), state.outbox_size(),
+                "Pushed %d queued rows as %d events via %s (outbox now %d)",
+                len(batch), len(payload["inputs"]["events"]), r.via, state.outbox_size(),
             )
-            # Adopt the client's current upload interval from the server.
-            try:
-                server_interval = find_upload_interval(r.json())
-            except ValueError:
-                server_interval = None
-            if server_interval is not None:
-                current = state.get_upload_interval_minutes(cfg.upload_interval_minutes)
-                if server_interval != current or state.get_setting("upload_interval_minutes") is None:
-                    state.set_setting("upload_interval_minutes", str(server_interval))
-                    if server_interval != current:
-                        log.info("Upload interval is now %d minutes (set by RR-IT)", server_interval)
+            apply_server_reply(state, cfg, r.data, log)
             continue
 
-        if r.status_code in (401, 403):
+        if r.status == 429:
+            log.warning("Receiver asked us to slow down (429) — retrying in %ss", _outbox_backoff_seconds)
+            _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
+            _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
+            return False
+
+        if r.status in (401, 403):
             log.error(
                 "Ingest rejected the request (%s): %s — check api_key/client_id. Leaving events queued.",
-                r.status_code, r.text[:300],
+                r.status, r.text[:300],
             )
             _outbox_next_attempt_at = time.monotonic() + MAX_BACKOFF_SECONDS
             return False
 
-        if r.status_code in (400, 413, 422):
+        if r.status in (400, 413, 422):
             # 404 is deliberately NOT in this list: it means the ingest URL
             # itself is wrong or the endpoint is temporarily unpublished — a
             # config/server problem, not a bad batch. It falls through to the
@@ -819,7 +1017,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
                     "(rejected for %dm so far; dropped only after %dh of continuous "
                     "rejection, in case this is a temporary server-side fault). "
                     "First event timestamp: %s",
-                    len(batch), r.status_code, r.text[:300], _outbox_backoff_seconds,
+                    len(batch), r.status, r.text[:300], _outbox_backoff_seconds,
                     rejected_for // 60, MAX_BAD_BATCH_RETRY_SECONDS // 3600,
                     batch[0]["timestamp_iso"],
                 )
@@ -830,7 +1028,7 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
                 "Ingest has rejected the same batch of %d events (%s) continuously for "
                 "%dh: %s — dropping it so later events aren't blocked forever. "
                 "First event timestamp: %s",
-                len(batch), r.status_code, MAX_BAD_BATCH_RETRY_SECONDS // 3600,
+                len(batch), r.status, MAX_BAD_BATCH_RETRY_SECONDS // 3600,
                 r.text[:300], batch[0]["timestamp_iso"],
             )
             state.delete_ids([row["id"] for row in batch])
@@ -838,22 +1036,27 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
             continue
 
         log.warning(
-            "Ingest returned %s: %s — will retry in %ss",
-            r.status_code, r.text[:300], _outbox_backoff_seconds,
+            "Ingest (%s) returned %s: %s — will retry in %ss",
+            r.via, r.status, r.text[:300], _outbox_backoff_seconds,
         )
         _outbox_next_attempt_at = time.monotonic() + _outbox_backoff_seconds
         _outbox_backoff_seconds = min(_outbox_backoff_seconds * 2, MAX_BACKOFF_SECONDS)
         return False
 
 
-def maybe_upload(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> bool:
+def maybe_upload(
+    state: State, cfg: Config, session: requests.Session, log: logging.Logger, force: bool = False
+) -> bool:
     """Upload the outbox if the schedule says it's time (see upload_due and
-    the "Upload schedule" notes at the top). Returns True if an upload fully
+    the "Upload schedule" notes at the top), or straight away when force is
+    set (a "Refresh now" from the dashboard). Returns True if an upload fully
     drained the outbox. Recording is unaffected — poll_once() keeps queueing
     every poll; this only decides when to deliver."""
     interval_minutes = state.get_upload_interval_minutes(cfg.upload_interval_minutes)
     queued = state.outbox_size()
-    if not upload_due(
+    if force and queued > 0:
+        log.info("Uploading now (Refresh requested from the dashboard)")
+    elif not upload_due(
         now_epoch=time.time(),
         last_upload_epoch=state.get_last_upload_epoch(),
         interval_seconds=interval_minutes * 60,
@@ -867,6 +1070,75 @@ def maybe_upload(state: State, cfg: Config, session: requests.Session, log: logg
     return drained
 
 
+# --------------------------------------------------------------------------
+# Live view (v2.0.0.15+, opt-in per client)
+# --------------------------------------------------------------------------
+
+# What this PC is doing right now, as far as the last poll could tell:
+# app/website name only (never the window title or URL), active/idle, since when.
+_current = {"app": None, "idle": False, "since": None}
+
+
+def note_current_activity(transformed: list[dict], afk_events: list[dict]) -> None:
+    if transformed:
+        last = transformed[-1]
+        app = last.get("appOrDomain")
+        if app != _current["app"]:
+            _current["app"] = app
+            _current["since"] = last.get("timestamp")
+    if afk_events:
+        status = (afk_events[-1].get("data") or {}).get("status")
+        if status in ("afk", "not-afk"):
+            idle = status == "afk"
+            if idle != _current["idle"]:
+                _current["idle"] = idle
+                _current["since"] = afk_events[-1].get("timestamp") or _current["since"]
+
+
+def live_due(now_epoch: float, last_epoch: Optional[float], interval_seconds: int) -> bool:
+    return last_epoch is None or now_epoch - last_epoch >= interval_seconds or now_epoch < last_epoch
+
+
+_last_live_epoch: Optional[float] = None
+
+
+def maybe_send_live(state: State, cfg: Config, session: requests.Session, log: logging.Logger) -> bool:
+    """Send the Live view status if Live is on for this client and it's due.
+    Returns True if the receiver asked for an immediate upload ("Refresh now").
+    Best-effort: a failure here never affects uploads."""
+    global _last_live_epoch
+    if not cfg.receiver_url or state.get_setting("live_enabled") != "1" or not _current["app"]:
+        return False
+    interval = clamp_live_interval(state.get_setting("live_interval_seconds") or LIVE_DEFAULT_INTERVAL_SECONDS)
+    now = time.time()
+    if not live_due(now, _last_live_epoch, interval):
+        return False
+    _last_live_epoch = now
+    payload = {
+        "inputs": {
+            "apiKey": cfg.api_key,
+            "clientId": cfg.client_id,
+            "hostname": cfg.hostname,
+            "app": _current["app"],
+            "state": "idle" if _current["idle"] else "active",
+            "since": _current["since"],
+        }
+    }
+    try:
+        r = session.post(cfg.receiver_url + "/ins/live", json=payload, timeout=10)
+        data = r.json() if r.status_code == 200 else None
+    except (requests.RequestException, ValueError) as exc:
+        log.debug("Live status not sent: %s", exc)
+        return False
+    if not isinstance(data, dict):
+        return False
+    live = data.get("live")
+    if isinstance(live, dict) and not live.get("enabled"):
+        state.set_setting("live_enabled", "0")
+        log.info("Live view is now off for this client")
+    return bool(data.get("uploadNow"))
+
+
 def poll_once(aw: AWClient, state: State, cfg: Config, log: logging.Logger) -> None:
     buckets = aw.list_buckets()
     window_id, afk_id, web_ids = pick_buckets(buckets, cfg.hostname)
@@ -876,6 +1148,7 @@ def poll_once(aw: AWClient, state: State, cfg: Config, log: logging.Logger) -> N
         return
 
     afk_events = aw.get_events(afk_id, state.get_watermark(afk_id), POLL_BATCH_LIMIT) if afk_id else []
+    note_current_activity([], afk_events)
     afk_intervals = build_afk_intervals(afk_events)
     if afk_id and afk_events:
         state.set_watermark(afk_id, afk_events[-1]["timestamp"])
@@ -896,6 +1169,7 @@ def poll_once(aw: AWClient, state: State, cfg: Config, log: logging.Logger) -> N
     state.set_progress(window_id, *new_progress)
 
     transformed = transform_window_events(deduped_events, afk_intervals, web_lookup)
+    note_current_activity(transformed, afk_events)
     state.enqueue(transformed)
     state.set_watermark(window_id, window_events[-1]["timestamp"])
     log.info("Queued %d events from AW (outbox now %d)", len(transformed), state.outbox_size())
@@ -945,9 +1219,10 @@ def main() -> None:
         return
 
     log.info(
-        "RR-IT Insight pusher starting — host=%s client=%s aw=%s -> %s (upload every %d min when active, "
-        "idle catch-up every %dh)",
-        cfg.hostname, cfg.client_id, cfg.aw_api_url, cfg.zite_ingest_url,
+        "RR-IT Insight pusher %s starting — host=%s client=%s aw=%s -> receiver %s, fallback %s "
+        "(upload every %d min when active, idle catch-up every %dh)",
+        read_agent_version(), cfg.hostname, cfg.client_id, cfg.aw_api_url, cfg.receiver_url or "(off)",
+        cfg.zite_ingest_url,
         state.get_upload_interval_minutes(cfg.upload_interval_minutes), IDLE_CATCHUP_SECONDS // 3600,
     )
 
@@ -959,8 +1234,14 @@ def main() -> None:
         except Exception:
             log.exception("Unexpected error during poll — continuing")
 
+        upload_now = False
         try:
-            maybe_upload(state, cfg, session, log)
+            upload_now = maybe_send_live(state, cfg, session, log)
+        except Exception:
+            log.exception("Unexpected error sending live status — continuing")
+
+        try:
+            maybe_upload(state, cfg, session, log, force=upload_now)
         except Exception:
             log.exception("Unexpected error during upload — continuing")
 
