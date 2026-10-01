@@ -90,9 +90,84 @@ next upload — no reinstall. `upload_interval_minutes` in `config.json` is
 only the starting value. Consecutive queued rows for the same window are
 merged into one event before upload (totals unchanged).
 
-Rough cost per PC per month (office hours): ~530 runs at 30 minutes, ~330 at
-60. The dashboard is up to one interval behind; its "Last updated" time shows
-when each PC last uploaded. USB events still upload straight away.
+Rough cost per PC per month (office hours) when uploading straight to Zite:
+~530 runs at 30 minutes, ~330 at 60. From v2.0.0.15 uploads go through the
+receiver instead (next section), which makes the Zite cost independent of the
+number of PCs.
+
+## Receiver (v2.0.0.15+)
+
+Activity and USB uploads go to the **RR-IT receiver**
+(`https://rrit-receiver.ekelleher.workers.dev`, a Cloudflare Worker with a D1
+database in the EU, shared with Device Monitor but on its own `/ins/` routes,
+tables and secret). The Insight Zite app collects everything queued there in
+**one run every 5 minutes**, about 8,600 runs a month whatever the number of
+PCs. Because uploads no longer cost Zite runs, the default upload interval via
+the receiver is **5 minutes**, so dashboards are at most ~10 minutes behind.
+The console's "Upload every" setting still applies.
+
+- **Fallback**: if the receiver can't be reached or answers 404/5xx, the same
+  upload goes straight to Zite (the pre-2.0.0.15 path). If Zite hasn't
+  collected for 20+ minutes, the receiver tells the PC to *also* post directly
+  so dashboards don't go stale; Zite ignores the duplicate when it collects.
+- The receiver stores each upload as one row **without the ingest key** (it
+  keeps a SHA-256 of it); Zite checks that hash against the client's real key
+  before accepting anything. Suspended clients and clients without USB
+  Monitoring get the same 403s as from Zite.
+- USB events can now take up to ~5 minutes to appear (they used to be
+  immediate).
+- `"receiver_url": ""` in a device's `config.json` turns the receiver off for
+  that PC (straight to Zite, as before).
+
+## Live view (v2.0.0.15+, opt-in per client)
+
+When RR-IT switches Live view on for a client in the console, each PC sends a
+tiny status to the receiver about once a minute: the **current app or website
+name** and **active/idle** (and since when). Never window titles, URLs or
+screen content. The dashboard's Live tab reads it directly from the receiver
+with a short-lived pass issued by Zite, so live updates cost no Zite runs.
+Staff names never leave Zite; the receiver only holds host names. Live rows
+are removed when Live is switched off. Update the client's monitoring notice
+before switching it on.
+
+"Refresh now" (Live clients): asks that client's PCs to upload immediately;
+they act on it within about a minute. Limited to once every 5 minutes.
+
+## Auto-update (v2.0.0.15+)
+
+From v2.0.0.15, PCs update themselves to the version RR-IT **approves per
+client** in the console. Nothing updates until a version is approved, and
+never to an older version. How it's kept safe:
+
+1. The pusher only writes the approved version number to
+   `update-target.json` in the install folder (Program Files — standard users
+   can't write there).
+2. The Watchdog task (SYSTEM, every 15 minutes) downloads `manifest.json`,
+   `manifest.sig` and the installer for exactly that version from this repo's
+   GitHub release (fixed URL).
+3. It checks `manifest.sig` against the **release-signing public key built
+   into `watchdog.ps1`** (`installer/update-signing-public.pem` is the same
+   key), then the installer's size and SHA-256 against the signed manifest.
+   Anything that doesn't match is refused.
+4. It runs the installer silently with `/RRITUPDATE=1`, which keeps
+   `config.json` and leaves ActivityWatch alone.
+
+Releases are signed by the build (`installer/sign_release.py`) with the
+private key held in the **`UPDATE_SIGNING_KEY`** repository secret. A tag build
+fails if the secret is missing, the key doesn't match the public key, or the
+tag isn't exactly `v` + the installer's version. A failing update is retried
+at most hourly and abandoned after 3 attempts until a different version is
+approved. Progress is in `update-status.json` / `watchdog.log` and is shown in
+the console next to each PC's version.
+
+**Watchdog fix in v2.0.0.15**: until this release `watchdog.ps1` contained
+non-ASCII dashes, which Windows PowerShell 5.1 misreads in a file without a
+BOM, and the script failed to parse, so the watchdog never actually ran on
+client PCs. The file is now plain ASCII. Keep it that way.
+
+**Installer change**: the Watchdog task's run-time limit went from 5 to 30
+minutes, to allow for the ~100 MB download. A hand-added `extra_watch_drives`
+line in `config.json` is now kept across reinstalls/updates.
 
 ## Diagnosing a client machine
 
@@ -263,7 +338,11 @@ pusher/             the ActivityWatch pusher script + its config template
 installer/
   installer.iss      Inno Setup script — the actual installer logic
   watchdog.ps1       re-enables/restarts the Pusher service or USB Watcher
-                       task if something external disables them (v2.0.0+)
+                       task if something external disables them (v2.0.0+),
+                       and installs approved, signed updates (v2.0.0.15+).
+                       Keep it plain ASCII (PowerShell 5.1).
+  sign_release.py    signs each release's manifest for auto-update (CI)
+  update-signing-public.pem   public half of the release-signing key
   staging/            build output lands here (gitignored, created by CI —
                        compiled pusher/usb_watcher exes, the bundled AW
                        installer, and NSSM)
