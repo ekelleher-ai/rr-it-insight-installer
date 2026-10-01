@@ -56,7 +56,7 @@
 ; cancels the service is left with nothing still running or logging.
 
 #define MyAppName "RR-IT Insight Agent"
-#define MyAppVersion "2.0.0.14"
+#define MyAppVersion "2.0.0.15"
 #define MyAppPublisher "Rapid Response IT"
 #define ExtensionId "nglaklhklhcoonedhgnpgddginnjdadi"
 #define ExtensionUpdateUrl "https://clients2.google.com/service/update2/crx"
@@ -99,6 +99,14 @@ Source: "staging\nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; so it's referenced directly rather than via staging\.
 Source: "watchdog.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\pusher\config.example.json"; DestDir: "{app}"; DestName: "config.json.template"; Flags: ignoreversion
+
+[UninstallDelete]
+; Written at run time (not by [Files]), so the uninstaller wouldn't otherwise
+; remove them: version marker, auto-update hand-off files and downloads.
+Type: files; Name: "{app}\version.txt"
+Type: files; Name: "{app}\update-target.json"
+Type: files; Name: "{app}\update-status.json"
+Type: filesandordirs; Name: "{app}\updates"
 
 [Code]
 const
@@ -241,11 +249,46 @@ begin
   StringChangeEx(Result, '"', '\"', True);
 end;
 
+// True when started by the agent's own auto-update (watchdog.ps1 passes
+// /RRITUPDATE=1): ActivityWatch is already installed and running for the
+// user, so it's left alone (running AW's installer as SYSTEM could put a
+// second copy in the wrong profile).
+function IsAgentUpdate(): Boolean;
+begin
+  Result := ExpandConstant('{param:RRITUPDATE|0}') = '1';
+end;
+
+// Keep a hand-added "extra_watch_drives" line (USB4/Thunderbolt NVMe
+// enclosures, see README) across reinstalls and updates — WriteConfigFile
+// otherwise rewrites config.json from scratch.
+function ExistingExtraWatchDrivesLine(const ConfigPath: string): string;
+var
+  Lines: TArrayOfString;
+  i: Integer;
+  T: string;
+begin
+  Result := '';
+  if not LoadStringsFromFile(ConfigPath, Lines) then Exit;
+  for i := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    T := Trim(Lines[i]);
+    if Pos('"extra_watch_drives"', T) = 1 then
+    begin
+      if Copy(T, Length(T), 1) = ',' then
+        T := Copy(T, 1, Length(T) - 1);
+      if (Pos('[', T) > 0) and (Pos(']', T) > 0) then
+        Result := T;
+      Exit;
+    end;
+  end;
+end;
+
 procedure WriteConfigFile;
 var
   ConfigPath: string;
   Lines: TArrayOfString;
   UsbEnabledStr: string;
+  ExtraLine: string;
 begin
   if UsbMonitoringEnabled() then
     UsbEnabledStr := 'true'
@@ -253,6 +296,7 @@ begin
     UsbEnabledStr := 'false';
 
   ConfigPath := ExpandConstant('{app}\config.json');
+  ExtraLine := ExistingExtraWatchDrivesLine(ConfigPath);
   SetArrayLength(Lines, 8);
   Lines[0] := '{';
   Lines[1] := '  "aw_api_url": "http://localhost:5600",';
@@ -260,9 +304,22 @@ begin
   Lines[3] := '  "api_key": "' + JsonEscape(ConfigPage.Values[1]) + '",';
   Lines[4] := '  "client_id": "' + JsonEscape(ConfigPage.Values[0]) + '",';
   Lines[5] := '  "poll_interval_seconds": 30,';
-  Lines[6] := '  "usb_monitoring_enabled": ' + UsbEnabledStr;
-  Lines[7] := '}';
+  if ExtraLine <> '' then
+  begin
+    Lines[6] := '  "usb_monitoring_enabled": ' + UsbEnabledStr + ',';
+    SetArrayLength(Lines, 9);
+    Lines[7] := '  ' + ExtraLine;
+    Lines[8] := '}';
+  end
+  else
+  begin
+    Lines[6] := '  "usb_monitoring_enabled": ' + UsbEnabledStr;
+    Lines[7] := '}';
+  end;
   SaveStringsToFile(ConfigPath, Lines, False);
+  // The version this PC now runs — read by the pusher (reported to the
+  // console) and by watchdog.ps1 (auto-update never installs an older one).
+  SaveStringToFile(ExpandConstant('{app}\version.txt'), '{#MyAppVersion}', False);
 end;
 
 // ActivityWatch's own installer is silent (/VERYSILENT), so nothing launches
@@ -651,7 +708,7 @@ begin
   AddXmlLine(Lines, Count, '<?xml version="1.0"?>');
   AddXmlLine(Lines, Count, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
   AddXmlLine(Lines, Count, '  <RegistrationInfo>');
-  AddXmlLine(Lines, Count, '    <Description>RR-IT Insight watchdog. Runs as SYSTEM every 15 minutes and re-enables/restarts the Pusher service and USB Watcher task if something external has disabled them.</Description>');
+  AddXmlLine(Lines, Count, '    <Description>RR-IT Insight watchdog. Runs as SYSTEM every 15 minutes, re-enables/restarts the Pusher service and USB Watcher task if something external has disabled them, and installs agent updates RR-IT has approved (signed releases only).</Description>');
   AddXmlLine(Lines, Count, '  </RegistrationInfo>');
   AddXmlLine(Lines, Count, '  <Triggers>');
   AddXmlLine(Lines, Count, '    <TimeTrigger>');
@@ -679,7 +736,9 @@ begin
   AddXmlLine(Lines, Count, '    <AllowStartOnDemand>true</AllowStartOnDemand>');
   AddXmlLine(Lines, Count, '    <Enabled>true</Enabled>');
   AddXmlLine(Lines, Count, '    <Hidden>false</Hidden>');
-  AddXmlLine(Lines, Count, '    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>');
+  // 30 min (was 5): an approved update downloads the ~100 MB installer
+  // inside this task on the first run after approval.
+  AddXmlLine(Lines, Count, '    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>');
   AddXmlLine(Lines, Count, '    <Priority>7</Priority>');
   AddXmlLine(Lines, Count, '  </Settings>');
   AddXmlLine(Lines, Count, '  <Actions Context="Author">');
@@ -753,10 +812,13 @@ begin
     WriteConfigFile;
     GrantUsersAccessToProgramData(ExpandConstant('{commonappdata}\RR-IT Insight'));
 
-    // Step 2: silent ActivityWatch install
-    Exec(ExpandConstant('{tmp}\activitywatch-setup.exe'),
-      '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Step 2: silent ActivityWatch install — never during an auto-update
+    // (see IsAgentUpdate): that runs as SYSTEM, where AW's per-user install
+    // folder isn't even visible, and AW is already installed and running.
+    if not IsAgentUpdate() then
+      Exec(ExpandConstant('{tmp}\activitywatch-setup.exe'),
+        '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
     // Step 2b: launch ActivityWatch now, so it's up immediately rather than
     // waiting for the next logon. NOTE: we deliberately do NOT also
@@ -766,15 +828,20 @@ begin
     // adding a second, our-own Run-key entry on top of that caused two
     // full copies of AW (aw-qt, aw-server, both watchers) to launch at
     // every logon.
+    // Not during an auto-update: that runs as SYSTEM, and AW must run as the
+    // logged-on user (it already is — the update doesn't stop it).
     AwExePath := FindActivityWatchExe();
-    if AwExePath <> '' then
+    if (AwExePath <> '') and not IsAgentUpdate() then
       Exec(AwExePath, '', '', SW_HIDE, ewNoWait, ResultCode);
 
     // Step 3: Windows Defender exclusions — automatic wherever Defender is
     // the active AV. See AddDefenderExclusions above for why this can't be
     // done the same way for COMODO/McAfee.
+    // Skipped during an auto-update: the exclusions from the original
+    // install are still in place, and as SYSTEM AW's folder can't be found.
     AwDir := FindActivityWatchDir();
-    AddDefenderExclusions(ExpandConstant('{app}'), AwDir, ExpandConstant('{commonappdata}\RR-IT Insight'));
+    if not IsAgentUpdate() then
+      AddDefenderExclusions(ExpandConstant('{app}'), AwDir, ExpandConstant('{commonappdata}\RR-IT Insight'));
 
     // Step 4: Pusher as a Windows Service (v2.0.0+) — see the "v2.0.0
     // reliability rework" section above for why this replaced the old
