@@ -336,10 +336,25 @@ function FindActivityWatchExe(): string;
 var
   Candidate: string;
 begin
-  // v2.0.0.18+ installs AW machine-wide (/ALLUSERS -> Program Files), so
-  // the shared location is checked FIRST. localappdata is kept last as a
-  // fallback for machines carried over from a pre-2.0.0.18 per-user install.
+  // v2.0.0.18+ installs AW machine-wide (/ALLUSERS). Confirmed on a real PC
+  // (RoryMack/MSI test, 2 Oct): /ALLUSERS lands AW in the 32-bit Program
+  // Files — C:\Program Files (x86)\ActivityWatch\aw-qt.exe — because AW's
+  // own installer is 32-bit. So {commonpf32} is checked FIRST. The 64-bit
+  // Program Files and per-user localappdata are kept as fallbacks (older
+  // layouts / carried-over per-user installs).
   Result := '';
+  Candidate := ExpandConstant('{commonpf32}\ActivityWatch\aw-qt.exe');
+  if FileExists(Candidate) then
+  begin
+    Result := Candidate;
+    Exit;
+  end;
+  Candidate := ExpandConstant('{commonpf}\ActivityWatch\aw-qt.exe');
+  if FileExists(Candidate) then
+  begin
+    Result := Candidate;
+    Exit;
+  end;
   Candidate := ExpandConstant('{autopf}\ActivityWatch\aw-qt.exe');
   if FileExists(Candidate) then
   begin
