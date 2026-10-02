@@ -138,6 +138,18 @@ FIXED_DRIVE_FULL_SCAN_SECONDS = 120
 # just after sitting gone for this long, not instantly.
 DEBOUNCE_SECONDS = 30
 
+# Drives connected when the watcher stops (PC shut down, user logged off,
+# agent updated) are remembered in state.sqlite3. When the watcher starts
+# again, a drive with the SAME volume serial number that is present within
+# this many seconds is picked up silently — no new "connected" event and no
+# USB alert — because it was never unplugged as far as anyone can tell
+# (found 2 Oct 2026: a drive left plugged in overnight raised a fresh
+# "Device Connected" alert at the next logon). A remembered drive that is NOT
+# back by the end of this window was removed while the watcher wasn't
+# running, and is reported as disconnected then. Files written to a drive
+# while the watcher wasn't running can't be detected — nothing was watching.
+STARTUP_RESUME_SECONDS = 120
+
 # Windows drive type constants (from GetDriveTypeW). USB flash drives and SD
 # cards via a reader report DRIVE_REMOVABLE. Most external USB hard drives
 # and SSDs report DRIVE_FIXED instead — the same type as an internal disk —
@@ -266,9 +278,33 @@ class State:
                 file_size_bytes INTEGER,
                 queued_at_iso TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS connected_drives (
+                drive_letter TEXT PRIMARY KEY,
+                usb_serial_number TEXT,
+                usb_device_name TEXT,
+                connected_at_iso TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
+
+    # --- drives connected across a watcher restart (STARTUP_RESUME_SECONDS) ---
+    def remember_drive(self, drive_letter: str, serial: Optional[str], name: Optional[str]) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO connected_drives (drive_letter, usb_serial_number, usb_device_name, connected_at_iso) VALUES (?, ?, ?, ?)",
+            (drive_letter, serial, name, _now_iso()),
+        )
+        self.conn.commit()
+
+    def forget_drive(self, drive_letter: str) -> None:
+        self.conn.execute("DELETE FROM connected_drives WHERE drive_letter = ?", (drive_letter,))
+        self.conn.commit()
+
+    def remembered_drives(self) -> dict[str, dict]:
+        cur = self.conn.execute(
+            "SELECT drive_letter, usb_serial_number, usb_device_name FROM connected_drives"
+        )
+        return {row[0]: {"serial": row[1], "name": row[2]} for row in cur.fetchall()}
 
     def enqueue(self, events: list[dict]) -> None:
         if not events:
@@ -850,6 +886,26 @@ def flush_outbox(state: State, cfg: Config, session: requests.Session, log: logg
         return
 
 
+def match_remembered_drive(
+    drive: str, serial: Optional[str], remembered: dict[str, dict]
+) -> Optional[str]:
+    """If a drive appearing just after the watcher started is one that was
+    already connected when it last stopped, return the remembered entry's
+    drive letter (it may have come back under a different letter); else None.
+
+    Matching is by volume serial number only — a drive whose serial can't be
+    read is always treated as newly connected, so a different stick at the
+    same drive letter can never be mistaken for the remembered one."""
+    if not serial:
+        return None
+    if drive in remembered and remembered[drive].get("serial") == serial:
+        return drive
+    for letter, entry in remembered.items():
+        if entry.get("serial") == serial:
+            return letter
+    return None
+
+
 def main() -> None:
     DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     handlers: list[logging.Handler] = [
@@ -905,6 +961,19 @@ def main() -> None:
     # drive_letter -> {"info": <same shape as a tracked entry>, "disconnected_at": epoch_seconds}
     # Drives that vanished but might just be blipping — see DEBOUNCE_SECONDS.
     pending_disconnect: dict[str, dict] = {}
+    # Drives that were connected when the watcher last stopped — see
+    # STARTUP_RESUME_SECONDS. Emptied as they're matched or time out.
+    try:
+        remembered = state.remembered_drives()
+    except Exception:
+        log.exception("Could not read remembered drives — treating every drive as new")
+        remembered = {}
+    started_mono = time.monotonic()
+    if remembered:
+        log.info(
+            "Remembered from last run (still connected when the watcher stopped): %s",
+            ", ".join(f"{d} serial {e.get('serial') or 'unknown'}" for d, e in remembered.items()),
+        )
 
     while True:
         try:
@@ -928,7 +997,22 @@ def main() -> None:
                     continue
                 label, serial = get_volume_info(drive)
                 device_name = label or drive.rstrip("\\")
-                log.info("USB device connected: %s (serial %s)", device_name, serial or "unknown")
+                resumed_from = (
+                    match_remembered_drive(drive, serial, remembered)
+                    if remembered and time.monotonic() - started_mono < STARTUP_RESUME_SECONDS
+                    else None
+                )
+                if resumed_from is not None:
+                    remembered.pop(resumed_from, None)
+                    if resumed_from != drive:
+                        state.forget_drive(resumed_from)
+                    log.info(
+                        "USB device %s (serial %s) was already connected before the watcher started — "
+                        "resuming quietly, no new connect event",
+                        device_name, serial,
+                    )
+                else:
+                    log.info("USB device connected: %s (serial %s)", device_name, serial or "unknown")
                 baseline, truncated = scan_drive(drive, log)
                 tracked[drive] = {
                     "name": device_name,
@@ -954,13 +1038,37 @@ def main() -> None:
                     # settle_written_files().
                     "pending": {},
                 }
-                state.enqueue([{
-                    "eventType": "connected",
-                    "timestamp": _now_iso(),
-                    "usbDeviceName": device_name,
-                    "usbSerialNumber": serial,
-                    "driveLetter": drive,
-                }])
+                state.remember_drive(drive, serial, device_name)
+                if resumed_from is None:
+                    state.enqueue([{
+                        "eventType": "connected",
+                        "timestamp": _now_iso(),
+                        "usbDeviceName": device_name,
+                        "usbSerialNumber": serial,
+                        "driveLetter": drive,
+                    }])
+
+            # Remembered drives that haven't come back within the window were
+            # removed while the watcher wasn't running: report the disconnect
+            # now so every connect still has a matching disconnect.
+            if remembered and time.monotonic() - started_mono >= STARTUP_RESUME_SECONDS:
+                for letter, entry in list(remembered.items()):
+                    log.info(
+                        "USB device %s (serial %s) was removed while the watcher wasn't running",
+                        entry.get("name") or letter, entry.get("serial") or "unknown",
+                    )
+                    state.enqueue([{
+                        "eventType": "disconnected",
+                        "timestamp": _now_iso(),
+                        "usbDeviceName": entry.get("name") or letter.rstrip("\\"),
+                        "usbSerialNumber": entry.get("serial"),
+                        "driveLetter": letter,
+                    }])
+                    # If another drive now sits at this letter, its own row
+                    # has already replaced this one — leave it alone.
+                    if letter not in tracked:
+                        state.forget_drive(letter)
+                remembered.clear()
 
             # Drives that disappeared — start the debounce clock rather than
             # reporting a disconnect immediately.
@@ -989,6 +1097,7 @@ def main() -> None:
                             "fileSizeBytes": size,
                         } for rel_path, size, first_seen in unsettled])
                     log.info("USB device disconnected: %s", info["name"])
+                    state.forget_drive(drive)
                     state.enqueue([{
                         "eventType": "disconnected",
                         "timestamp": _now_iso(),
