@@ -68,6 +68,12 @@ investigation continues separately from this reliability rework.
 This should be tested end-to-end on a real Windows machine (ideally the Test
 Clint pilot laptop again) before being relied on for other clients.
 
+## v2.0.0.19: idle PCs check in every 15 minutes
+
+One pusher change: `IDLE_CATCHUP_SECONDS` 4 h → 15 min (see "Upload schedule"
+below). Also the first release with the pre-configured per-client build
+(see that section). No installer-side changes from 2.0.0.18.
+
 ## ActivityWatch: machine-wide, no tray icon, runs as the logged-in user (v2.0.0.18+)
 
 From v2.0.0.18 the installer:
@@ -89,6 +95,48 @@ From v2.0.0.18 the installer:
 recorded. Staff must still be told about the monitoring in the client's written
 monitoring notice before it is switched on — see the monitoring-notice template.
 
+## Pre-configured per-client installer (v2.0.0.18+)
+
+For a rollout you don't want to type the Client ID and ingest key on every
+PC. The build workflow can compile an installer with one client's details
+baked in, named `RR-IT-Insight-Setup-<Slug>.exe`, which skips the Client ID /
+key page and the USB page and just installs. Copy it to each of that client's
+PCs (USB stick, Action1, share) and run it; it still asks for admin
+credentials at the UAC prompt like any install.
+
+One-off setup per client:
+
+1. In the RR-IT console, note the client's Client ID and ingest key.
+2. In this repo: Settings > Secrets and variables > Actions > New repository
+   secret. Name it `INGEST_KEY_<SLUG IN CAPITALS>` (e.g. `INGEST_KEY_RORYMACK`),
+   value = the ingest key. Paste it yourself — don't put the key in a chat,
+   a workflow input or a commit.
+
+Each build:
+
+1. Actions > "Build RR-IT Insight installer" > Run workflow. Fill in
+   `client_slug` (letters/digits only, e.g. `RoryMack`), `client_id`, and tick
+   `usb_monitoring` only if that client has asked for it. Run it.
+2. When the run is green, download the artifact `RR-IT-Insight-Setup-<Slug>`
+   from the run page. That's the file to copy to their PCs.
+
+Notes:
+
+- The key is read from the secret and never shown in the run page or logs.
+  It is, of course, inside the .exe (it has to be — the same as it's inside
+  `config.json` on every installed PC), so treat the per-client .exe as that
+  client's credential: don't put it anywhere public, and if it leaks, rotate
+  the key in the console and rebuild.
+- Per-client builds are run artifacts only (30-day retention). They are never
+  published as a Release and carry no auto-update manifest. PCs installed
+  from one still auto-update from the normal signed release, which keeps
+  their existing `config.json`.
+- A per-client installer run on a PC that already has a different client's
+  config replaces it — the baked-in client wins.
+- Rebuild after a new version is tagged if you want a per-client installer
+  at that version; the artifact is compiled from whatever is on `main` when
+  you run it.
+
 ## Upload schedule and Zite workflow runs (v2.0.0.14+)
 
 Every upload from a device is one Zite "workflow run", and the plan allows a
@@ -100,8 +148,11 @@ The pusher still reads ActivityWatch every 30 seconds and queues everything
 locally (nothing is recorded differently or lost), but it only **uploads**:
 - once per **upload interval** while there's real activity queued — set per
   client in the RR-IT console ("Upload every", default 30 minutes, 5–240);
-- every **4 hours** at most while only idle time is queued (PC locked or
-  unattended, left on overnight);
+- every **15 minutes** at most while only idle time is queued (PC locked or
+  unattended, left on overnight) — v2.0.0.19+; it was 4 hours while each
+  upload cost a Zite workflow run, which stopped being true when uploads
+  moved to the receiver. The quarter-hourly check-in is what lets the
+  dashboard tell an idle PC from one that has gone offline;
 - straight away the very first time after install, so a new device appears
   on the dashboard immediately.
 
