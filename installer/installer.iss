@@ -497,9 +497,24 @@ end;
 // AC-power condition, and gets NSSM's own restart-on-exit policy instead
 // of relying on a Scheduled Task's logon trigger or Windows' own
 // (unconfigurable, silent) task-auto-disable-after-failures behaviour.
-procedure InstallPusherService();
+// True when the Service Control Manager reports the Pusher service as
+// RUNNING. `find` exits 0 only when its search text is present, and
+// sc.exe's "STATE : 4 RUNNING" line is plain ASCII, so this is a safe
+// match. Used instead of nssm.exe's exit code — see InstallPusherService.
+function PusherServiceRunning(): Boolean;
 var
   ResultCode: Integer;
+begin
+  Result := Exec(ExpandConstant('{cmd}'),
+    '/C ' + ExpandConstant('{sys}\sc.exe') + ' query "' + PusherServiceName + '" | ' +
+    ExpandConstant('{sys}\find.exe') + ' "RUNNING" >nul',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
+procedure InstallPusherService();
+var
+  ResultCode, StartCode, Attempt: Integer;
+  Running: Boolean;
   Nssm, AppExe, AppDir, ConfigPath, ProgramDataDir: string;
 begin
   Nssm := NssmExePath();
@@ -544,9 +559,28 @@ begin
   Exec(Nssm, 'set "' + PusherServiceName + '" AppStderr "' + ProgramDataDir + '\service-stderr.log"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
-  if not Exec(Nssm, 'start "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+  // Start it, but do NOT judge success by nssm's exit code. Confirmed on
+  // Test Clint (MSI, 2.0.0.18): `nssm start` returned 1 while the service
+  // was already up and pushing — service-stderr.log empty, pusher.log
+  // showing a clean start one second after the call. aw_pusher.exe is a
+  // PyInstaller-packed exe that takes a few seconds to come up, and nssm's
+  // own wait for the RUNNING state gives up before that. Ask the Service
+  // Control Manager for the real state instead, allowing up to 15 s.
+  StartCode := 0;
+  Exec(Nssm, 'start "' + PusherServiceName + '"', '', SW_HIDE, ewWaitUntilTerminated, StartCode);
+  Running := False;
+  for Attempt := 1 to 15 do
+  begin
+    if PusherServiceRunning() then
+    begin
+      Running := True;
+      Break;
+    end;
+    Sleep(1000);
+  end;
+  if not Running then
     InstallWarnings := InstallWarnings +
-      '- The Pusher service was installed but did not start (nssm exit code ' + IntToStr(ResultCode) + ').' + #13#10;
+      '- The Pusher service was installed but is not running (nssm start exit code ' + IntToStr(StartCode) + ').' + #13#10;
 end;
 
 procedure RemovePusherService();
