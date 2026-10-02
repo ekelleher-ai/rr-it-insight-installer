@@ -282,6 +282,16 @@ cancel out, very small files). A permanently-connected backup drive is
 therefore walked every 2 minutes rather than every 15 seconds; it still
 wakes periodically, so it won't sleep for long stretches.
 
+**Drives left plugged in** (v2.0.0.17+): the watcher remembers which drives
+were connected (by volume serial number) when it stops — PC shut down, user
+logged off, agent updated. When it starts again, the same drive found within
+2 minutes is picked up quietly: no new "Device Connected" event and no USB
+alert. A different drive at that letter, or a drive whose serial can't be
+read, is still reported as connected. A remembered drive that isn't back
+within 2 minutes is reported as disconnected (it was removed while the
+watcher wasn't running). Files written to a drive while the watcher wasn't
+running can't be detected.
+
 **One report per file** (v2.0.0.14+): a newly-written file is reported once
 it's been seen unchanged on two consecutive scans, so a large copy still in
 progress is no longer reported twice (part-size, then full size). The report
