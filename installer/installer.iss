@@ -61,6 +61,37 @@
 #define ExtensionId "nglaklhklhcoonedhgnpgddginnjdadi"
 #define ExtensionUpdateUrl "https://clients2.google.com/service/update2/crx"
 
+; ---- Pre-configured per-client build (optional) ----------------------
+; build.yml's "Run workflow" form compiles a client-specific installer by
+; passing these on the ISCC command line, e.g.
+;   ISCC /DPRESET_CLIENT_SLUG=RoryMack /DPRESET_CLIENT_ID=... /DPRESET_API_KEY=... /DPRESET_USB=0 installer.iss
+; With PRESET_CLIENT_ID set, the wizard skips the Client ID / Ingest Key
+; page and the USB page and writes the presets straight into config.json,
+; so the resulting .exe can simply be copied to each of that client's PCs
+; and run. The presets WIN over any config.json already on the machine —
+; a client's own installer is authoritative for that client. Without them
+; (every push/tag build) this is the normal generic installer that asks.
+; The per-client .exe is never published as a Release and carries no
+; auto-update manifest: PCs still auto-update from the generic signed
+; release, which keeps their existing config.json.
+#ifndef PRESET_CLIENT_ID
+  #define PRESET_CLIENT_ID ""
+#endif
+#ifndef PRESET_API_KEY
+  #define PRESET_API_KEY ""
+#endif
+#ifndef PRESET_USB
+  #define PRESET_USB "0"
+#endif
+#ifndef PRESET_CLIENT_SLUG
+  #define PRESET_CLIENT_SLUG ""
+#endif
+#if PRESET_CLIENT_SLUG != ""
+  #define OutputName "RR-IT-Insight-Setup-" + PRESET_CLIENT_SLUG
+#else
+  #define OutputName "RR-IT-Insight-Setup"
+#endif
+
 [Setup]
 AppId={{B6D6E2B1-4E9B-4C2B-9B3E-RRITINSIGHT01}}
 AppName={#MyAppName}
@@ -70,7 +101,7 @@ DefaultDirName={autopf}\RR-IT Insight
 DefaultGroupName=RR-IT Insight
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
-OutputBaseFilename=RR-IT-Insight-Setup
+OutputBaseFilename={#OutputName}
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -181,6 +212,13 @@ begin
   else if Pos('false', ValStr) = 1 then Result := False;
 end;
 
+// True when this .exe was compiled with a client's details baked in
+// (build.yml "Run workflow" with a client slug) — see PRESET_* at the top.
+function IsPresetBuild(): Boolean;
+begin
+  Result := '{#PRESET_CLIENT_ID}' <> '';
+end;
+
 procedure InitializeWizard;
 var
   ExistingConfigPath, ExistingJson: string;
@@ -229,6 +267,21 @@ begin
     ConfigPage.Values[1] := ReadJsonStringValue(ExistingJson, 'api_key');
     UsbPage.Values[0] := ReadJsonBoolValue(ExistingJson, 'usb_monitoring_enabled', False);
   end;
+
+  // Pre-configured per-client build: the compiled-in presets are
+  // authoritative (see the PRESET_* notes at the top of this file).
+  if IsPresetBuild() then
+  begin
+    ConfigPage.Values[0] := '{#PRESET_CLIENT_ID}';
+    ConfigPage.Values[1] := '{#PRESET_API_KEY}';
+    UsbPage.Values[0] := ('{#PRESET_USB}' = '1');
+  end;
+end;
+
+// A pre-configured client build has nothing to ask on these two pages.
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := IsPresetBuild() and ((PageID = ConfigPage.ID) or (PageID = UsbPage.ID));
 end;
 
 function UsbMonitoringEnabled(): Boolean;
