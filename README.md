@@ -68,6 +68,27 @@ investigation continues separately from this reliability rework.
 This should be tested end-to-end on a real Windows machine (ideally the Test
 Clint pilot laptop again) before being relied on for other clients.
 
+## ActivityWatch: machine-wide, no tray icon, runs as the logged-in user (v2.0.0.18+)
+
+From v2.0.0.18 the installer:
+
+- installs ActivityWatch **machine-wide** (`/ALLUSERS`, into Program Files), so it
+  works for every user on the PC — not per-user into the profile of whoever ran
+  the installer. (Before this, installing while signed in as an admin over a
+  standard user's session put ActivityWatch in the admin's profile, and the real
+  user's PC recorded nothing after the next restart.)
+- starts ActivityWatch through a Scheduled Task (**RR-IT Insight ActivityWatch**,
+  built-in Users group, logon + boot triggers, no power conditions) that runs
+  `aw-qt --no-gui`, so it runs for whichever user logs on and shows **no
+  system-tray icon** — staff can't see it or Quit it. The Watchdog restarts it if
+  it stops.
+- removes ActivityWatch's own Startup-folder shortcut, so the tray-icon copy
+  never starts.
+
+**Compliance note:** hiding the tray icon only changes visibility, not what is
+recorded. Staff must still be told about the monitoring in the client's written
+monitoring notice before it is switched on — see the monitoring-notice template.
+
 ## Upload schedule and Zite workflow runs (v2.0.0.14+)
 
 Every upload from a device is one Zite "workflow run", and the plan allows a
