@@ -4,7 +4,29 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-  workflow_dispatch: {}
+  workflow_dispatch:
+    # Leave all three blank for a plain generic build. Fill them in to
+    # compile a PRE-CONFIGURED installer for one client (Client ID, ingest
+    # key and USB choice baked in, wizard pages skipped) — see the
+    # PRESET_* notes at the top of installer/installer.iss. The ingest key
+    # is NOT an input: it is read from the repository secret named
+    # INGEST_KEY_<CLIENT_SLUG in upper case>, e.g. INGEST_KEY_RORYMACK,
+    # so it never appears in the run page or logs. Per-client builds are
+    # run artifacts only — never a Release, never auto-update signed.
+    inputs:
+      client_slug:
+        description: "Client slug for a pre-configured build, letters/digits only (e.g. RoryMack). Blank = generic installer."
+        required: false
+        default: ""
+      client_id:
+        description: "That client's Client ID (from the RR-IT console). Required when client_slug is set."
+        required: false
+        default: ""
+      usb_monitoring:
+        description: "Bake in USB removable-drive monitoring = ON for this client"
+        type: boolean
+        required: false
+        default: false
 
 # Needed so GITHUB_TOKEN can create the GitHub Release on tag builds.
 permissions:
@@ -64,12 +86,58 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
-      - name: Compile installer
+      - name: Resolve build flavour
+        id: flavour
+        shell: pwsh
+        env:
+          CLIENT_SLUG: ${{ inputs.client_slug }}
+          CLIENT_ID: ${{ inputs.client_id }}
+        run: |
+          $slug = ($env:CLIENT_SLUG ?? "").Trim()
+          if ($slug -eq "") {
+            "preset=false" >> $env:GITHUB_OUTPUT
+            "artifact=RR-IT-Insight-Setup" >> $env:GITHUB_OUTPUT
+            Write-Host "Generic build"
+            exit 0
+          }
+          if ($slug -notmatch '^[A-Za-z0-9]+$') { throw "client_slug must be letters/digits only, got '$slug'" }
+          if (($env:CLIENT_ID ?? "").Trim() -eq "") { throw "client_id is required for a pre-configured build" }
+          "preset=true" >> $env:GITHUB_OUTPUT
+          "slug=$slug" >> $env:GITHUB_OUTPUT
+          "secret_name=INGEST_KEY_$($slug.ToUpper())" >> $env:GITHUB_OUTPUT
+          "artifact=RR-IT-Insight-Setup-$slug" >> $env:GITHUB_OUTPUT
+          Write-Host "Pre-configured build for $slug (key from secret INGEST_KEY_$($slug.ToUpper()))"
+
+      - name: Compile installer (generic)
+        if: steps.flavour.outputs.preset != 'true'
         shell: cmd
         run: |
           "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\installer.iss
 
+      - name: Compile installer (pre-configured for client)
+        if: steps.flavour.outputs.preset == 'true'
+        shell: pwsh
+        env:
+          CLIENT_SLUG: ${{ steps.flavour.outputs.slug }}
+          CLIENT_ID: ${{ inputs.client_id }}
+          USB_ON: ${{ inputs.usb_monitoring }}
+          SECRET_NAME: ${{ steps.flavour.outputs.secret_name }}
+          INGEST_KEY: ${{ secrets[steps.flavour.outputs.secret_name] }}
+        run: |
+          if (($env:INGEST_KEY ?? "") -eq "") {
+            throw "Repository secret $env:SECRET_NAME is missing or empty. Add it under Settings > Secrets and variables > Actions, then re-run."
+          }
+          $usb = if ($env:USB_ON -eq "true") { "1" } else { "0" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DPRESET_CLIENT_SLUG=$env:CLIENT_SLUG" `
+            "/DPRESET_CLIENT_ID=$($env:CLIENT_ID.Trim())" `
+            "/DPRESET_API_KEY=$env:INGEST_KEY" `
+            "/DPRESET_USB=$usb" `
+            installer\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
       - name: Sign release manifest (auto-update)
+        if: steps.flavour.outputs.preset != 'true'
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: |
@@ -79,8 +147,8 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: RR-IT-Insight-Setup
-          path: installer\Output\RR-IT-Insight-Setup.exe
+          name: ${{ steps.flavour.outputs.artifact }}
+          path: installer\Output\${{ steps.flavour.outputs.artifact }}.exe
           retention-days: 30
 
       - name: Publish GitHub Release
