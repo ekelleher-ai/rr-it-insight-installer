@@ -100,6 +100,31 @@ if ($usbTask) {
 # 15 minutes.
 
 
+# --- ActivityWatch Scheduled Task (v2.0.0.18+) --------------------------
+# AW itself is the data source; if its task is disabled or not running, the
+# Pusher has nothing to send. Only present on machines installed with
+# v2.0.0.18+ (older installs rely on AW's own Startup shortcut), so - like
+# the USB task above - act only if the task exists, no "else" noise.
+
+$awTaskName = 'RR-IT Insight ActivityWatch'
+$awTask = Get-ScheduledTask -TaskName $awTaskName -ErrorAction SilentlyContinue
+
+if ($awTask) {
+    if ($awTask.State -eq 'Disabled') {
+        Write-Log "ActivityWatch task was Disabled - re-enabling."
+        Enable-ScheduledTask -TaskName $awTaskName -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    # aw-qt launches the watchers then can exit, so checking the task 'State'
+    # isn't enough - check the actual process. If aw-qt isn't running, start
+    # the task (MultipleInstancesPolicy IgnoreNew means this can't double up).
+    $awProc = Get-Process -Name 'aw-qt' -ErrorAction SilentlyContinue
+    if (-not $awProc) {
+        Write-Log "aw-qt not running - starting the ActivityWatch task."
+        Start-ScheduledTask -TaskName $awTaskName -ErrorAction SilentlyContinue
+    }
+}
+
 # --- Auto-update (v2.0.0.15+) ---------------------------------------------
 #
 # RR-IT approves an agent version per client in the RR-IT console. The pusher

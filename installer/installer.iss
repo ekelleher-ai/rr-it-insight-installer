@@ -56,7 +56,7 @@
 ; cancels the service is left with nothing still running or logging.
 
 #define MyAppName "RR-IT Insight Agent"
-#define MyAppVersion "2.0.0.17"
+#define MyAppVersion "2.0.0.18"
 #define MyAppPublisher "Rapid Response IT"
 #define ExtensionId "nglaklhklhcoonedhgnpgddginnjdadi"
 #define ExtensionUpdateUrl "https://clients2.google.com/service/update2/crx"
@@ -117,6 +117,10 @@ const
   PusherServiceName = 'RR-IT Insight Pusher';
   UsbWatcherTaskName = 'RR-IT Insight USB Watcher';
   WatchdogTaskName = 'RR-IT Insight Watchdog';
+  // ActivityWatch run as a Scheduled Task (v2.0.0.18+) so it runs for the
+  // interactively logged-on user with no tray icon — not as whoever ran
+  // the installer (fixed the admin-profile problem found on RoryMack-L023).
+  ActivityWatchTaskName = 'RR-IT Insight ActivityWatch';
   // Well-known SIDs — used so the USB Watcher task runs for ANY
   // interactively logged-on user (not one named account) and the Watchdog
   // task runs as SYSTEM. Only reachable via a Task XML definition — the
@@ -332,8 +336,11 @@ function FindActivityWatchExe(): string;
 var
   Candidate: string;
 begin
+  // v2.0.0.18+ installs AW machine-wide (/ALLUSERS -> Program Files), so
+  // the shared location is checked FIRST. localappdata is kept last as a
+  // fallback for machines carried over from a pre-2.0.0.18 per-user install.
   Result := '';
-  Candidate := ExpandConstant('{localappdata}\Programs\ActivityWatch\aw-qt.exe');
+  Candidate := ExpandConstant('{autopf}\ActivityWatch\aw-qt.exe');
   if FileExists(Candidate) then
   begin
     Result := Candidate;
@@ -345,7 +352,7 @@ begin
     Result := Candidate;
     Exit;
   end;
-  Candidate := ExpandConstant('{autopf}\ActivityWatch\aw-qt.exe');
+  Candidate := ExpandConstant('{localappdata}\Programs\ActivityWatch\aw-qt.exe');
   if FileExists(Candidate) then
     Result := Candidate;
 end;
@@ -688,6 +695,63 @@ begin
   Result := Lines;
 end;
 
+// ActivityWatch task (v2.0.0.18+): same shape as the USB Watcher task —
+// built-in Users group principal so it runs for whichever user logs on
+// (never the installing admin's profile), logon + boot triggers, both power
+// conditions off, run only when a user is logged on (AW needs the
+// interactive desktop session; a Session-0 service can't see window focus).
+// Command is aw-qt with --no-gui, so the watchers run with no system-tray
+// icon — nothing for staff to spot or Quit. ExecutionTimeLimit PT0S = no
+// time limit (it runs for the whole session, like the USB watcher).
+function BuildActivityWatchTaskXml(const AwExePath: string): TArrayOfString;
+var
+  Lines: TArrayOfString;
+  Count: Integer;
+begin
+  Count := 0;
+  AddXmlLine(Lines, Count, '<?xml version="1.0"?>');
+  AddXmlLine(Lines, Count, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
+  AddXmlLine(Lines, Count, '  <RegistrationInfo>');
+  AddXmlLine(Lines, Count, '    <Description>RR-IT Insight ActivityWatch tracker. Runs aw-qt --no-gui (no tray icon) for any interactively logged-on user (Users group), started at both logon and boot, with no AC-power condition.</Description>');
+  AddXmlLine(Lines, Count, '  </RegistrationInfo>');
+  AddXmlLine(Lines, Count, '  <Triggers>');
+  AddXmlLine(Lines, Count, '    <LogonTrigger>');
+  AddXmlLine(Lines, Count, '      <Enabled>true</Enabled>');
+  AddXmlLine(Lines, Count, '    </LogonTrigger>');
+  AddXmlLine(Lines, Count, '    <BootTrigger>');
+  AddXmlLine(Lines, Count, '      <Enabled>true</Enabled>');
+  AddXmlLine(Lines, Count, '    </BootTrigger>');
+  AddXmlLine(Lines, Count, '  </Triggers>');
+  AddXmlLine(Lines, Count, '  <Principals>');
+  AddXmlLine(Lines, Count, '    <Principal id="Author">');
+  AddXmlLine(Lines, Count, '      <GroupId>' + SidUsersGroup + '</GroupId>');
+  AddXmlLine(Lines, Count, '      <RunLevel>LeastPrivilege</RunLevel>');
+  AddXmlLine(Lines, Count, '    </Principal>');
+  AddXmlLine(Lines, Count, '  </Principals>');
+  AddXmlLine(Lines, Count, '  <Settings>');
+  AddXmlLine(Lines, Count, '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
+  AddXmlLine(Lines, Count, '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>');
+  AddXmlLine(Lines, Count, '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>');
+  AddXmlLine(Lines, Count, '    <AllowHardTerminate>true</AllowHardTerminate>');
+  AddXmlLine(Lines, Count, '    <StartWhenAvailable>true</StartWhenAvailable>');
+  AddXmlLine(Lines, Count, '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>');
+  AddXmlLine(Lines, Count, '    <AllowStartOnDemand>true</AllowStartOnDemand>');
+  AddXmlLine(Lines, Count, '    <Enabled>true</Enabled>');
+  AddXmlLine(Lines, Count, '    <Hidden>false</Hidden>');
+  AddXmlLine(Lines, Count, '    <RunOnlyIfIdle>false</RunOnlyIfIdle>');
+  AddXmlLine(Lines, Count, '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
+  AddXmlLine(Lines, Count, '    <Priority>7</Priority>');
+  AddXmlLine(Lines, Count, '  </Settings>');
+  AddXmlLine(Lines, Count, '  <Actions Context="Author">');
+  AddXmlLine(Lines, Count, '    <Exec>');
+  AddXmlLine(Lines, Count, '      <Command>"' + AwExePath + '"</Command>');
+  AddXmlLine(Lines, Count, '      <Arguments>--no-gui</Arguments>');
+  AddXmlLine(Lines, Count, '    </Exec>');
+  AddXmlLine(Lines, Count, '  </Actions>');
+  AddXmlLine(Lines, Count, '</Task>');
+  Result := Lines;
+end;
+
 // Watchdog: SYSTEM principal, fires every 15 minutes starting immediately
 // after registration (StartBoundary is a fixed past date purely so the
 // Repetition interval has a base to count from — combined with the
@@ -815,24 +879,41 @@ begin
     // Step 2: silent ActivityWatch install — never during an auto-update
     // (see IsAgentUpdate): that runs as SYSTEM, where AW's per-user install
     // folder isn't even visible, and AW is already installed and running.
+    // /ALLUSERS (v2.0.0.18+) installs AW machine-wide into Program Files so
+    // it's reachable by every user — not per-user into the profile of
+    // whoever ran the installer (which, when an admin enters credentials
+    // over a standard user's session, is the WRONG profile and leaves the
+    // real user with nothing — the RoryMack-L023 case).
     if not IsAgentUpdate() then
       Exec(ExpandConstant('{tmp}\activitywatch-setup.exe'),
-        '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS',
+        '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS /ALLUSERS',
         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
-    // Step 2b: launch ActivityWatch now, so it's up immediately rather than
-    // waiting for the next logon. NOTE: we deliberately do NOT also
-    // register our own autostart entry for it — ActivityWatch's own
-    // installer already drops a Startup-folder shortcut
-    // (shell:startup\ActivityWatch.lnk) for that. Confirmed by testing:
-    // adding a second, our-own Run-key entry on top of that caused two
-    // full copies of AW (aw-qt, aw-server, both watchers) to launch at
-    // every logon.
-    // Not during an auto-update: that runs as SYSTEM, and AW must run as the
-    // logged-on user (it already is — the update doesn't stop it).
+    // Step 2b (v2.0.0.18+): run ActivityWatch via our own Scheduled Task,
+    // NOT via AW's own autostart shortcut. The task uses the built-in Users
+    // group as principal (so it runs for whichever user is logged on, not
+    // the installing admin) and launches aw-qt with --no-gui (no tray icon,
+    // so staff can't see or Quit it — the monitoring-notice disclosure is
+    // what makes this acceptable, see README). This is the same proven
+    // pattern as the USB Watcher task. First remove AW's own Startup-folder
+    // shortcut (common + per-user) so the tray-icon GUI copy doesn't also
+    // start and double up. Skipped during an auto-update (runs as SYSTEM;
+    // AW is already installed and its task already registered).
     AwExePath := FindActivityWatchExe();
-    if (AwExePath <> '') and not IsAgentUpdate() then
-      Exec(AwExePath, '', '', SW_HIDE, ewNoWait, ResultCode);
+    if not IsAgentUpdate() then
+    begin
+      DeleteFile(ExpandConstant('{commonstartup}\ActivityWatch.lnk'));
+      DeleteFile(ExpandConstant('{userstartup}\ActivityWatch.lnk'));
+      if AwExePath <> '' then
+      begin
+        RegisterTaskFromXml(ActivityWatchTaskName, BuildActivityWatchTaskXml(AwExePath));
+        Exec(ExpandConstant('{sys}\schtasks.exe'), '/Run /TN "' + ActivityWatchTaskName + '"',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      end
+      else
+        InstallWarnings := InstallWarnings +
+          '- ActivityWatch was not found after install, so its auto-start task could not be created. Activity tracking will not run on this PC.' + #13#10;
+    end;
 
     // Step 3: Windows Defender exclusions — automatic wherever Defender is
     // the active AV. See AddDefenderExclusions above for why this can't be
@@ -940,6 +1021,7 @@ begin
     Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM usb_watcher.exe',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     RemoveTaskIfExists(WatchdogTaskName);
+    RemoveTaskIfExists(ActivityWatchTaskName);
 
     if RemoveAw = IDYES then
     begin
@@ -969,6 +1051,7 @@ begin
       StartupShortcut := ExpandConstant('{userstartup}\ActivityWatch.lnk');
       if FileExists(StartupShortcut) then
         DeleteFile(StartupShortcut);
+      DeleteFile(ExpandConstant('{commonstartup}\ActivityWatch.lnk'));
 
       // Step 4: remove the forced browser-extension policy — no reason to
       // keep force-installing aw-watcher-web once AW itself is gone.
