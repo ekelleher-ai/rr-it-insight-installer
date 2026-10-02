@@ -23,7 +23,7 @@ Design notes (see RR-IT Insight spec, sections 2 and 7):
     response is logged and retried next cycle.
   - Batched uploads (v2.0.0.14+): ActivityWatch is read and queued every
     poll, but the queue is only uploaded once per client-configured interval
-    while there's real activity, or every 4h while only idle time is queued.
+    while there's real activity, or every 15 min while only idle time is queued.
     See "Upload schedule" below.
   - Receiver first (v2.0.0.15+): uploads go to the RR-IT receiver (a small
     Cloudflare Worker), which Zite collects from in one run every 5 minutes,
@@ -159,7 +159,13 @@ MAX_BACKOFF_SECONDS = 300
 # differently, nothing lost), but the outbox is only UPLOADED:
 #   - once per upload interval, when there's real (non-idle) activity queued;
 #   - otherwise, while only idle time is queued (PC locked/unattended,
-#     overnight), at most every IDLE_CATCHUP_SECONDS;
+#     overnight), at most every IDLE_CATCHUP_SECONDS. This was 4 hours
+#     while uploads cost a Zite workflow run each; since 2 Oct 2026 they go
+#     to the Cloudflare receiver, so from v2.0.0.19 it's 15 minutes — an
+#     idle PC still checks in every quarter-hour, which lets the dashboard
+#     tell "idle since 18:26" from "offline since 18:26" (seen live on
+#     RoryMack-L023 that evening: locked at 18:26, nothing heard until the
+#     next logon two hours later);
 #   - immediately on the very first upload after install, so a new device
 #     shows up on the dashboard straight away.
 # The interval is set per client in the RR-IT console; ingestEvents returns it
@@ -170,7 +176,7 @@ MAX_BACKOFF_SECONDS = 300
 DEFAULT_UPLOAD_INTERVAL_MINUTES = 30
 MIN_UPLOAD_INTERVAL_MINUTES = 5
 MAX_UPLOAD_INTERVAL_MINUTES = 240
-IDLE_CATCHUP_SECONDS = 4 * 3600
+IDLE_CATCHUP_SECONDS = 15 * 60
 
 # Consecutive outbox rows for the same window that pick up exactly where the
 # previous one ended (the same focused window reported again on the next
@@ -1220,10 +1226,10 @@ def main() -> None:
 
     log.info(
         "RR-IT Insight pusher %s starting — host=%s client=%s aw=%s -> receiver %s, fallback %s "
-        "(upload every %d min when active, idle catch-up every %dh)",
+        "(upload every %d min when active, idle catch-up every %d min)",
         read_agent_version(), cfg.hostname, cfg.client_id, cfg.aw_api_url, cfg.receiver_url or "(off)",
         cfg.zite_ingest_url,
-        state.get_upload_interval_minutes(cfg.upload_interval_minutes), IDLE_CATCHUP_SECONDS // 3600,
+        state.get_upload_interval_minutes(cfg.upload_interval_minutes), IDLE_CATCHUP_SECONDS // 60,
     )
 
     while True:
