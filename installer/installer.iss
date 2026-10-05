@@ -56,7 +56,7 @@
 ; cancels the service is left with nothing still running or logging.
 
 #define MyAppName "RR-IT Insight Agent"
-#define MyAppVersion "2.0.0.19"
+#define MyAppVersion "2.0.0.20"
 #define MyAppPublisher "Rapid Response IT"
 #define ExtensionId "nglaklhklhcoonedhgnpgddginnjdadi"
 #define ExtensionUpdateUrl "https://clients2.google.com/service/update2/crx"
@@ -986,6 +986,11 @@ begin
     // whoever ran the installer (which, when an admin enters credentials
     // over a standard user's session, is the WRONG profile and leaves the
     // real user with nothing — the RoryMack-L023 case).
+    // Note (v2.0.0.20): AW's installer ignores /NOICONS and still creates
+    // Start menu entries (staff could open AW and change its settings).
+    // watchdog.ps1 removes them for all users - and Step 4a below runs the
+    // watchdog straight after this install, so they're gone within seconds,
+    // and on existing PCs at the watchdog's next 15-minute run.
     if not IsAgentUpdate() then
       Exec(ExpandConstant('{tmp}\activitywatch-setup.exe'),
         '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS /ALLUSERS',

@@ -125,6 +125,47 @@ if ($awTask) {
     }
 }
 
+# --- ActivityWatch shortcuts (v2.0.0.20+) ---------------------------------
+# ActivityWatch's own installer ignores /NOICONS and puts ActivityWatch
+# entries in the Start menu, which let staff open AW and change its settings.
+# Remove them (all users + every profile) whenever they reappear. Start menu
+# entries are only launchers, so this is safe on every install.
+#
+# Also remove AW's own Startup-folder shortcut from every profile - but ONLY
+# where our ActivityWatch task exists (v2.0.0.18+), because older installs
+# still rely on that shortcut to start AW. On PCs upgraded from <=2.0.0.17
+# the per-user copy survived the upgrade (the installer can't reach other
+# users' profiles) and brought back the tray icon - this clears it.
+# RR-IT Insight itself stays listed in Installed apps and Services.
+
+$startMenuRoots = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs")
+$profileRoots = Get-ChildItem -Path "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue
+foreach ($p in $profileRoots) {
+    $startMenuRoots += (Join-Path $p.FullName 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs')
+}
+
+foreach ($root in $startMenuRoots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    $items = Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like '*ActivityWatch*' -or $_.Name -like 'aw-*' }
+    foreach ($item in $items) {
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $item.FullName)) {
+            Write-Log "Removed ActivityWatch Start menu entry: $($item.FullName)"
+        }
+    }
+
+    if ($awTask) {
+        $startupLnk = Join-Path $root 'Startup\ActivityWatch.lnk'
+        if (Test-Path -LiteralPath $startupLnk) {
+            Remove-Item -LiteralPath $startupLnk -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $startupLnk)) {
+                Write-Log "Removed ActivityWatch Startup shortcut: $startupLnk"
+            }
+        }
+    }
+}
+
 # --- Auto-update (v2.0.0.15+) ---------------------------------------------
 #
 # RR-IT approves an agent version per client in the RR-IT console. The pusher
