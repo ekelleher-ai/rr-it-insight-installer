@@ -68,6 +68,21 @@ investigation continues separately from this reliability rework.
 This should be tested end-to-end on a real Windows machine (ideally the Test
 Clint pilot laptop again) before being relied on for other clients.
 
+## v2.0.0.20: no ActivityWatch shortcuts in the Start menu
+
+ActivityWatch's own installer ignores `/NOICONS` and puts ActivityWatch
+entries in the Start menu, which let staff open AW and change its settings
+(found on RoryMack-L023, 4 Oct). `watchdog.ps1` now removes any
+`*ActivityWatch*` / `aw-*` Start menu entry for all users and every profile,
+every time it runs (straight after install, then every 15 minutes). It also
+removes AW's own per-user Startup shortcut wherever our ActivityWatch task
+exists — the leftover that brought the tray icon back on PCs upgraded from
+2.0.0.17 or earlier. Each removal is written to `watchdog.log`.
+
+Existing PCs are cleaned at their first watchdog run after updating — no
+reinstall. RR-IT Insight itself stays listed in Installed apps and Services
+(tamper-resistance, not concealment — staff are told through the client's monitoring notice).
+
 ## v2.0.0.19: idle PCs check in every 15 minutes
 
 One pusher change: `IDLE_CATCHUP_SECONDS` 4 h → 15 min (see "Upload schedule"
