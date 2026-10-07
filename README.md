@@ -68,6 +68,16 @@ investigation continues separately from this reliability rework.
 This should be tested end-to-end on a real Windows machine (ideally the Test
 Clint pilot laptop again) before being relied on for other clients.
 
+## v2.0.0.21: no direct-to-Zite fallback
+
+Before this version, if the receiver refused an upload (5xx/404) or couldn't be
+reached, the pusher and USB watcher sent that batch straight to Zite instead.
+That spent Zite workflow runs and triggered "fell back to Zite" alerts on
+RoryMack-L04/L05 (6 Oct) when the receiver briefly returned 503s. Now both keep
+the batch in the outbox and retry the receiver with the existing backoff (up to
+5 minutes between tries). Nothing is lost: batches stay on disk until the
+receiver accepts them. Zite is still used only when no receiver URL is configured.
+
 ## v2.0.0.20: no ActivityWatch shortcuts in the Start menu
 
 ActivityWatch's own installer ignores `/NOICONS` and puts ActivityWatch
