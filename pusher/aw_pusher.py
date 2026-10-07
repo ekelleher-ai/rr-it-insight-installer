@@ -196,8 +196,9 @@ COALESCE_MAX_GAP_SECONDS = 2.0
 #                    stale. Zite ignores the duplicate when it later collects.
 #   live           — {"enabled": bool, "intervalSeconds": n} for Live view.
 #   update         — {"version": "x.y.z.w"} approved by RR-IT, or null.
-# Fallback: if the receiver can't be reached, or answers 404/5xx, the upload
-# goes straight to Zite (old behaviour). 401/403/400/413/422 are real answers
+# v2.0.0.21+: if the receiver can't be reached, or answers 404/5xx, the upload
+# stays in the outbox and the receiver is retried with backoff (no Zite
+# fallback any more). 401/403/400/413/422 are real answers
 # and handled like Zite's; 429 means "slow down" and is just retried later.
 # config.json "receiver_url": "" turns the receiver off for this PC.
 # --------------------------------------------------------------------------
@@ -870,8 +871,9 @@ def deliver(
     payload: dict,
     log: logging.Logger,
 ) -> _Reply:
-    """Send one upload: receiver first (if configured), Zite as the fallback.
-    Shared by the pusher and usb_watcher.py's copy of this logic."""
+    """Send one upload to the receiver (if configured), else to Zite.
+    v2.0.0.21+: no Zite fallback when the receiver fails; the caller keeps the
+    batch in the outbox and retries. Mirrored in usb_watcher.py."""
     if receiver_url:
         reply = _Reply(None)
         for attempt in range(RECEIVER_TRIES):
@@ -891,10 +893,18 @@ def deliver(
                         direct.status, (direct.text or direct.error)[:200],
                     )
             return reply
+        # v2.0.0.21: never fall back to Zite when the receiver refuses or
+        # can't be reached. Every direct upload costs a Zite workflow run, and
+        # a receiver blip used to send a whole office's PCs to Zite at once
+        # (RoryMack-L04/L05, 6 Oct). The upload stays in the local outbox and
+        # flush_outbox retries the receiver with exponential backoff (up to
+        # MAX_BACKOFF_SECONDS), so nothing is lost. Zite is only used when no
+        # receiver is configured at all (very old config.json).
         log.warning(
-            "Receiver unavailable (%s) — sending this upload straight to Zite instead.",
+            "Receiver unavailable (%s) — keeping this upload in the outbox to retry the receiver.",
             reply.status if reply.status is not None else reply.error[:200],
         )
+        return reply
     return _post_json(session, zite_url, payload, "zite")
 
 

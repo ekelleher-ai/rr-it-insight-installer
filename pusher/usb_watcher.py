@@ -194,7 +194,7 @@ IGNORED_FILE_NAMES = {"desktop.ini", "thumbs.db", "autorun.inf"}
 # Receiver (v2.0.0.15+) — same as aw_pusher.py: USB batches go to the RR-IT
 # receiver first and Zite collects them every 5 minutes (one Zite run for all
 # PCs), so USB events can show up to ~5 minutes later than before. If the
-# receiver can't be reached or answers 404/5xx the batch goes straight to Zite.
+# receiver can't be reached or answers 404/5xx the batch stays queued and is retried (v2.0.0.21+).
 # config.json "receiver_url": "" turns the receiver off for this PC.
 DEFAULT_RECEIVER_URL = "https://rrit-receiver.ekelleher.workers.dev"
 RECEIVER_TRIES = 2
@@ -749,7 +749,7 @@ def _post_json(session: requests.Session, url: str, payload: dict, via: str) -> 
 
 
 def deliver(session: requests.Session, cfg: Config, payload: dict, log: logging.Logger) -> _Reply:
-    """Receiver first, Zite as the fallback (mirrors aw_pusher.deliver)."""
+    """Receiver if configured, else Zite; no Zite fallback on receiver failure (v2.0.0.21, mirrors aw_pusher.deliver)."""
     if cfg.receiver_url:
         reply = _Reply(None)
         for _ in range(RECEIVER_TRIES):
@@ -763,8 +763,11 @@ def deliver(session: requests.Session, cfg: Config, payload: dict, log: logging.
                     log.warning("Direct USB delivery also asked for, Zite answered %s %s",
                                 direct.status, (direct.text or direct.error)[:200])
             return reply
-        log.warning("Receiver unavailable (%s) — sending USB events straight to Zite instead.",
+        # v2.0.0.21: keep it in the USB outbox and retry the receiver (backoff)
+        # rather than posting to Zite — same rule as aw_pusher.deliver.
+        log.warning("Receiver unavailable (%s) — keeping USB events in the outbox to retry the receiver.",
                     reply.status if reply.status is not None else reply.error[:200])
+        return reply
     return _post_json(session, cfg.zite_usb_ingest_url, payload, "zite")
 
 
