@@ -63,7 +63,33 @@ jobs:
           # NSSM ("the Non-Sucking Service Manager") wraps aw_pusher.exe as
           # a real Windows Service — see installer.iss's InstallPusherService
           # for why the pusher moved off Scheduled Tasks in v2.0.0.
-          Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile "$env:RUNNER_TEMP\nssm.zip"
+          #
+          # nssm.cc goes down from time to time (503s on 7 and 8 Oct 2026
+          # failed builds), so try it a few times, then fall back to the
+          # Internet Archive's copy of the same file. Either way the zip
+          # must match the published SHA-256 of nssm-2.24.zip, so the
+          # fallback can only ever give us the identical file.
+          $expected = "727d1e42275c605e0f04aba98095c38a8e1e46def453cdffce42869428aa6743"
+          $zip = "$env:RUNNER_TEMP\nssm.zip"
+          $sources = @(
+            "https://nssm.cc/release/nssm-2.24.zip",
+            "https://nssm.cc/release/nssm-2.24.zip",
+            "https://nssm.cc/release/nssm-2.24.zip",
+            "https://web.archive.org/web/20250206084707id_/https://nssm.cc/release/nssm-2.24.zip"
+          )
+          $ok = $false
+          foreach ($url in $sources) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $zip -TimeoutSec 60
+              $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+              if ($hash -eq $expected) { Write-Host "NSSM downloaded from $url"; $ok = $true; break }
+              Write-Warning "NSSM from $url has the wrong SHA-256 ($hash), trying next source"
+            } catch {
+              Write-Warning "NSSM download from $url failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds 10
+            }
+          }
+          if (-not $ok) { throw "Could not download a verified nssm-2.24.zip from any source" }
           Expand-Archive -Path "$env:RUNNER_TEMP\nssm.zip" -DestinationPath "$env:RUNNER_TEMP\nssm" -Force
           Copy-Item "$env:RUNNER_TEMP\nssm\nssm-2.24\win64\nssm.exe" -Destination "installer\staging\nssm.exe"
 
