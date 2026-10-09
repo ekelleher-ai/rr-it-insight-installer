@@ -103,9 +103,18 @@ jobs:
           # automatically by Actions, no setup needed.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ActivityWatch/activitywatch/releases/latest" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" }
-          $asset = $release.assets | Where-Object { $_.name -like "*windows*.exe" -or $_.name -like "*win*setup*.exe" } | Select-Object -First 1
-          if (-not $asset) { throw "Could not find a Windows installer asset in the latest ActivityWatch release" }
+          # PINNED to ActivityWatch v0.13.2 (the version every working PC
+          # runs). Do NOT go back to "releases/latest": v0.14.0 (6 Oct 2026)
+          # added a "tauri" edition listed first, the old wildcard picked it,
+          # and it installs differently (no aw-qt.exe, not Inno Setup), so
+          # fresh installs failed with "ActivityWatch was not found after
+          # install" (Mantis Energy, 9 Oct). Move to a newer AW only after
+          # testing it on a PC first.
+          $awTag = "v0.13.2"
+          $awAsset = "activitywatch-$awTag-windows-x86_64-setup.exe"
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ActivityWatch/activitywatch/releases/tags/$awTag" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $asset = $release.assets | Where-Object { $_.name -eq $awAsset } | Select-Object -First 1
+          if (-not $asset) { throw "Could not find $awAsset in ActivityWatch release $awTag" }
           Write-Host "Downloading $($asset.name) from $($asset.browser_download_url)"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "installer\staging\activitywatch-setup.exe"
 
