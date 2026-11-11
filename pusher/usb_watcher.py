@@ -604,6 +604,30 @@ def scan_drive(drive_letter: str, log: logging.Logger) -> tuple[dict[str, tuple[
     return snapshot, truncated
 
 
+def drive_readable(drive_letter: str) -> bool:
+    """True when the drive's top-level folder can be listed right now.
+
+    False for a drive that has a letter but can't be read yet: a BitLocker To
+    Go stick that hasn't been unlocked, a hardware-encrypted stick waiting for
+    its password, a card reader with no card in it, a drive still mounting.
+
+    Why this matters (v2.0.0.22): os.walk() swallows "can't list this folder"
+    errors, so scanning a locked drive returned an EMPTY snapshot that looked
+    exactly like a genuinely empty stick. The watcher took that as a complete
+    baseline, and the moment the drive was unlocked every file already on it
+    was reported as newly written (11 Nov 2026, Edmond's PC: BitLocker stick
+    plugged in 09:21, unlocked 09:27 -> 2,792 false "file written" events and
+    a run of alert emails). A drive that isn't readable now gets no baseline
+    until it is — see "awaiting_baseline" in main()."""
+    try:
+        with os.scandir(drive_letter) as it:
+            for _ in it:
+                break
+        return True
+    except OSError:
+        return False
+
+
 def _is_fixed_drive(drive_letter: str) -> bool:
     """True for a DRIVE_FIXED volume (an external USB hard drive/SSD, or an
     allow-listed one), which gets the hybrid scan schedule. False for a
@@ -1016,7 +1040,21 @@ def main() -> None:
                     )
                 else:
                     log.info("USB device connected: %s (serial %s)", device_name, serial or "unknown")
-                baseline, truncated = scan_drive(drive, log)
+                # A drive that can't be read yet (locked BitLocker stick, no
+                # card in the reader, still mounting) gets NO baseline now:
+                # an empty one would make every file on it look new the
+                # moment it's unlocked. The baseline is taken on the first
+                # cycle the drive can be read — see drive_readable().
+                readable = drive_readable(drive)
+                if readable:
+                    baseline, truncated = scan_drive(drive, log)
+                else:
+                    baseline, truncated = {}, False
+                    log.info(
+                        "%s can't be read yet (locked, encrypted or not ready) — "
+                        "waiting until it can before noting what's already on it",
+                        device_name,
+                    )
                 tracked[drive] = {
                     "name": device_name,
                     "serial": serial,
@@ -1040,6 +1078,8 @@ def main() -> None:
                     # second scan before being reported — see
                     # settle_written_files().
                     "pending": {},
+                    # True until the first successful baseline scan.
+                    "awaiting_baseline": not readable,
                 }
                 state.remember_drive(drive, serial, device_name)
                 if resumed_from is None:
@@ -1115,6 +1155,39 @@ def main() -> None:
             # pending_disconnect above is included in this cycle too.)
             for drive in current_drives & set(tracked.keys()):
                 info = tracked[drive]
+
+                # Not readable this cycle (still locked, or locked again /
+                # card pulled from the reader): nothing to compare, and an
+                # empty scan must not be mistaken for "every file deleted".
+                if not drive_readable(drive):
+                    continue
+                if info.get("awaiting_baseline"):
+                    # First time this drive can be read since it was plugged
+                    # in (e.g. just unlocked). Everything on it now was there
+                    # before monitoring could see it, so it becomes the
+                    # baseline and nothing is reported. Files written from
+                    # the next cycle on are reported as normal.
+                    baseline, truncated = scan_drive(drive, log)
+                    info["files"] = baseline
+                    info["baseline_complete"] = not truncated
+                    info["watch_started_at"] = now_ts
+                    info["fixed"] = _is_fixed_drive(drive)
+                    info["free_bytes"] = get_free_bytes(drive)
+                    info["last_full_scan"] = time.monotonic()
+                    info["pending"] = {}
+                    info["awaiting_baseline"] = False
+                    # Label and serial usually can't be read while locked.
+                    label, serial = get_volume_info(drive)
+                    if label:
+                        info["name"] = label
+                    if serial and not info.get("serial"):
+                        info["serial"] = serial
+                    state.remember_drive(drive, info["serial"], info["name"])
+                    log.info(
+                        "%s is now readable — %d existing file(s) noted, none reported",
+                        info["name"], len(baseline),
+                    )
+                    continue
 
                 # Decide whether to walk this drive's files this cycle — see
                 # should_scan_drive() and FIXED_DRIVE_FULL_SCAN_SECONDS.
