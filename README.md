@@ -68,6 +68,27 @@ investigation continues separately from this reliability rework.
 This should be tested end-to-end on a real Windows machine (ideally the Test
 Clint pilot laptop again) before being relied on for other clients.
 
+## v2.0.0.22: locked/encrypted USB sticks no longer report every file as written
+
+USB watcher only. A BitLocker To Go (or other password-protected) stick has a
+drive letter as soon as it is plugged in, but can't be read until it is
+unlocked. The watcher scanned it straight away, got nothing back, and treated
+that as "an empty stick". When the user unlocked it, every file already on it
+was reported as newly written (11 Nov 2026: 2,792 false events and a run of
+alert emails from one stick).
+
+Now a drive that can't be read when it appears gets no baseline until it can
+be read. The first readable scan becomes the baseline and reports nothing;
+files written after that are reported as before. The "connected" event is
+still sent at plug-in. A drive that becomes unreadable again mid-session
+(re-locked, card pulled from a reader) is skipped until it is readable.
+
+Limit to be honest about: a file copied onto a locked stick can't exist, but a
+file copied in the same ~15-second cycle in which the stick is unlocked is
+part of the first baseline and is not reported.
+
+No changes to the activity pusher, the installer logic or the watchdog.
+
 ## v2.0.0.21: no direct-to-Zite fallback
 
 Before this version, if the receiver refused an upload (5xx/404) or couldn't be
